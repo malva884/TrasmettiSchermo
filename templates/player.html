@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>TV · {{ gruppo or 'player' }}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #stage { width: 100vw; height: 100vh; overflow: hidden; background: #000; }
+  #stage video, #stage img, #stage iframe {
+    width: 100vw; height: 100vh; border: 0; display: block;
+    object-fit: contain; background: #000;
+  }
+  #stage iframe { object-fit: unset; }
+  /* schermata attesa registrazione */
+  #idle {
+    position: relative; width: 100vw; height: 100vh;
+    background: #1b1b2f; overflow: hidden;
+    font-family: system-ui, sans-serif;
+  }
+  #idle .bg {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; opacity: 0; transition: opacity .5s; z-index: 1;
+  }
+  /* fallback se manca /static/attesa_tv.png */
+  #idle .fb {
+    position: absolute; inset: 0; z-index: 0;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; color: #fff;
+  }
+  #idle .fb .t { font-size: 4.6vw; font-weight: 800; color: #5eead4;
+                 letter-spacing: .02em; }
+  #idle .fb .s { font-size: 2.2vw; color: #e2e8f0; margin-top: 2vh;
+                 font-weight: 600; }
+  #idle .fb .foot { position: absolute; bottom: 4vh; font-size: 1.3vw;
+                    color: #a5b4fc; }
+  /* badge codice: copre quello cotto nell'immagine e mostra il vero ID */
+  #idle .code {
+    position: absolute; left: 50%; top: 80%; z-index: 2;
+    transform: translate(-50%, -50%);
+    background: #fbbf24; color: #111827; border-radius: 14px;
+    padding: 1.4vh 2.4vw; display: flex; align-items: center;
+    gap: 1.4vw; white-space: nowrap;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+  #idle .code .lbl { font-size: 2vw; font-weight: 800; }
+  #idle .code .val {
+    font-family: ui-monospace, monospace; font-size: 2.8vw;
+    font-weight: 800; background: #111827; color: #fbbf24;
+    padding: .4vh 1.2vw; border-radius: 8px; letter-spacing: .06em;
+  }
+  #status {
+    position: fixed; top: 8px; right: 10px; z-index: 9999;
+    font: 12px/1 system-ui, sans-serif; color: #0f0; opacity: 0;
+    transition: opacity .4s; background: rgba(0,0,0,.6);
+    padding: 4px 8px; border-radius: 4px; pointer-events: none;
+  }
+  #status.off { opacity: .9; color: #f66; }
+  #identify {
+    position: fixed; inset: 0; z-index: 99999; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,.75); font-family: system-ui, sans-serif;
+  }
+  #identify .box {
+    background: #111827; border: 4px solid #4f46e5; border-radius: 20px;
+    padding: 4vh 6vw; text-align: center; color: #fff;
+    box-shadow: 0 0 60px rgba(79,70,229,.6);
+  }
+  #identify .id { font-size: 9vw; font-weight: 800; letter-spacing: .05em;
+                  color: #a5b4fc; }
+  #identify .nm { font-size: 3vw; font-weight: 600; margin-top: 1vh; }
+  #identify .gr { font-size: 2vw; color: #9ca3af; margin-top: 1vh; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="status"></div>
+<div id="identify"><div class="box">
+  <div class="id"></div>
+  <div class="nm"></div>
+  <div class="gr"></div>
+</div></div>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  var GRUPPO = {{ gruppo|tojson }};
+  var INITIAL = {{ content|tojson }};
+  var stage = document.getElementById('stage');
+  var statusEl = document.getElementById('status');
+  var iframeTimer = null;
+  var ytPlayer = null;
+  var ytWaitTimer = null;
+  var ytApiLoading = false;
+  var ytApiQueue = [];
+  var current = INITIAL;
+
+  // device_id persistente: generato una sola volta per browser/client
+  var DEVICE_ID = null;
+  try {
+    DEVICE_ID = localStorage.getItem('signage_device_id') ||
+                localStorage.getItem('ts_device_id');
+    if (!DEVICE_ID) {
+      DEVICE_ID = 'TV-' + Math.random().toString(36).slice(2, 6).toUpperCase();
+    }
+    localStorage.setItem('signage_device_id', DEVICE_ID);
+  } catch (e) {
+    DEVICE_ID = 'TV-' + Math.random().toString(36).slice(2, 6).toUpperCase();
+  }
+
+  function setStatus(txt, off) {
+    statusEl.textContent = txt;
+    statusEl.className = off ? 'off' : '';
+  }
+
+  function addCacheBuster(url) {
+    if (url && url.indexOf('/media/') !== -1 && url.indexOf('v=') === -1) {
+      return url + (url.indexOf('?') === -1 ? '?' : '&') + 'v=' + Date.now();
+    }
+    return url;
+  }
+
+  // ---- YouTube: parsing URL + embed/player API ----
+  function ytInfo(url) {
+    // estrae {videoId, listId} dai formati watch?v=, youtu.be/, embed/,
+    // shorts/, live/, v/ e dal parametro list= delle playlist
+    var u = (url || '').trim();
+    if (!u) return null;
+    var m = u.match(
+      /(?:youtube(?:-nocookie)?\.com\/(?:watch\?[^#]*v=|embed\/|shorts\/|live\/|v\/)|youtu\.be\/)([\w-]{6,})/i);
+    var videoId = m ? m[1] : null;
+    m = u.match(/[?&]list=([\w-]+)/i);
+    var listId = m ? m[1] : null;
+    if (!videoId && !listId) return null;
+    return { videoId: videoId, listId: listId };
+  }
+
+  function ytEmbedUrl(info) {
+    // embed HTTPS su youtube-nocookie: niente banner cookie su alcune TV
+    // e niente blocchi Mixed Content quando il server gira in HTTPS (Coolify)
+    var base = 'https://www.youtube-nocookie.com/embed/';
+    var params = 'autoplay=1&mute=1&rel=0&playsinline=1&loop=1';
+    if (info.listId) {
+      // playlist YouTube: loop=1 cicla l'intera lista
+      return base + encodeURIComponent(info.videoId || 'videoseries') +
+             '?' + params + '&list=' + encodeURIComponent(info.listId);
+    }
+    // video singolo: playlist=<ID> e' requisito obbligatorio delle API
+    // Embed di YouTube affinche' loop=1 funzioni
+    return base + encodeURIComponent(info.videoId) + '?' + params +
+           '&playlist=' + encodeURIComponent(info.videoId);
+  }
+
+  function loadYTApi(cb) {
+    // carica lazy la IFrame Player API (serve solo per intercettare ENDED)
+    if (window.YT && window.YT.Player) { cb(true); return; }
+    ytApiQueue.push(cb);
+    if (ytApiLoading) return;
+    ytApiLoading = true;
+    function flush(ok) {
+      var q = ytApiQueue.slice(); ytApiQueue = [];
+      q.forEach(function (f) { try { f(ok); } catch (e) {} });
+    }
+    window.onYouTubeIframeAPIReady = function () { flush(true); };
+    var tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    tag.onerror = function () { ytApiLoading = false; flush(false); };
+    document.head.appendChild(tag);
+  }
+
+  function clearStage() {
+    if (iframeTimer) { clearTimeout(iframeTimer); iframeTimer = null; }
+    if (ytWaitTimer) { clearTimeout(ytWaitTimer); ytWaitTimer = null; }
+    if (ytPlayer) { try { ytPlayer.destroy(); } catch (e) {} ytPlayer = null; }
+    // stop video playback before removing to free memory
+    var v = stage.querySelector('video');
+    if (v) { try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {} }
+    stage.innerHTML = '';
+  }
+
+  function showIdle() {
+    stage.innerHTML =
+      '<div id="idle">' +
+        '<div class="fb">' +
+          '<div class="t">NUOVO SCHERMO RILEVATO!</div>' +
+          '<div class="s">In attesa di essere associato&hellip;</div>' +
+          '<div class="foot">Regia Centrale TV</div>' +
+        '</div>' +
+        '<img class="bg" src="/static/attesa_tv.png" alt="" ' +
+             'onload="this.style.opacity=1">' +
+        '<div class="code"><span class="lbl">CODICE:</span>' +
+          '<span class="val">' + DEVICE_ID + '</span></div>' +
+      '</div>';
+  }
+
+  function render(c) {
+    if (!c) return;
+    current = c;
+    var url = c.url || '';
+    var tipo = c.tipo || 'idle';
+
+    // Fallback X-Frame-Options: redirect esplicito richiesto dalla regia
+    if (tipo === 'url' && c.mode === 'redirect') {
+      window.location.href = url;
+      return;
+    }
+
+    clearStage();
+
+    if (tipo === 'video') {
+      var v = document.createElement('video');
+      v.src = addCacheBuster(url);
+      v.autoplay = true; v.loop = true; v.muted = true;
+      v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
+      v.setAttribute('webkit-playsinline', '');
+      v.onerror = showIdle;
+      stage.appendChild(v);
+      var p = v.play(); if (p && p.catch) p.catch(function () {});
+    } else if (tipo === 'image') {
+      var im = document.createElement('img');
+      im.src = addCacheBuster(url);
+      im.onerror = showIdle;
+      stage.appendChild(im);
+    } else if (tipo === 'youtube') {
+      var info = ytInfo(c.url_raw || url);
+      if (!info) { showIdle(); return; }
+      if (c.playlist_attiva) {
+        // slide di playlist mista: IFrame Player API per intercettare il
+        // termine esatto del filmato (ENDED) -> avanza alla slide successiva.
+        // In ogni caso il server fa rispettare durata_sec come tempo massimo.
+        var holder = document.createElement('div');
+        stage.appendChild(holder);
+        var done = false;
+        var next = function () {
+          if (done) return; done = true;
+          socket.emit('playlist_next', { url: c.url_raw || url });
+        };
+        // se il video non parte entro 20s (API offline, embed bloccato)
+        // salta alla slide successiva invece di restare su schermo nero
+        ytWaitTimer = setTimeout(next, 20000);
+        loadYTApi(function (ok) {
+          if (!ok) { next(); return; }
+          if (!holder.parentNode) return;  // slide gia' cambiata
+          var vars = { autoplay: 1, mute: 1, rel: 0, playsinline: 1 };
+          if (info.listId) { vars.listType = 'playlist'; vars.list = info.listId; }
+          var cfg = {
+            host: 'https://www.youtube-nocookie.com',
+            width: '100%', height: '100%',
+            playerVars: vars,
+            events: {
+              onStateChange: function (e) {
+                if (e.data === YT.PlayerState.ENDED) { next(); }
+                else if (e.data === YT.PlayerState.PLAYING && ytWaitTimer) {
+                  clearTimeout(ytWaitTimer); ytWaitTimer = null;
+                }
+              },
+              onError: function () { setTimeout(next, 3000); }
+            }
+          };
+          if (info.videoId) cfg.videoId = info.videoId;
+          ytPlayer = new YT.Player(holder, cfg);
+        });
+      } else {
+        var f = document.createElement('iframe');
+        f.src = ytEmbedUrl(info);
+        f.setAttribute('frameborder', '0');
+        f.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
+        f.setAttribute('allowfullscreen', '');
+        stage.appendChild(f);
+      }
+    } else if (tipo === 'url') {
+      // mode 'proxy': la pagina passa dal proxy server-side che rimuove
+      // X-Frame-Options/CSP -> iframe funziona e il controllo WS resta attivo
+      var src = (c.mode === 'proxy')
+        ? '/proxy?u=' + encodeURIComponent(c.url_raw || url)
+        : url;
+      var f = document.createElement('iframe');
+      f.src = src;
+      f.setAttribute('frameborder', '0');
+      f.setAttribute('scrolling', 'no');
+      // delega autoplay con audio alle app in iframe: senza l'attributo
+      // Chrome blocca l'unmute anche dopo un gesto dell'utente
+      f.setAttribute('allow',
+        'autoplay; fullscreen; encrypted-media; picture-in-picture');
+      var loaded = false;
+      f.onload = function () { loaded = true; };
+      f.onerror = function () { showIdle(); };
+      stage.appendChild(f);
+      // euristica anti X-Frame-Options: niente load entro 12s -> idle
+      iframeTimer = setTimeout(function () {
+        if (!loaded) showIdle();
+      }, 12000);
+    } else {
+      showIdle();
+    }
+  }
+
+  // ---- WebSocket con riconnessione automatica (backoff esponenziale)
+  var socket = io({
+    transports: ["websocket", "polling"],
+    reconnection: true,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 30000,
+    reconnectionAttempts: Infinity,
+    timeout: 10000
+  });
+
+  function join() {
+    socket.emit('join_room', {
+      gruppo: GRUPPO,
+      device_id: DEVICE_ID,
+      user_agent: navigator.userAgent
+    });
+  }
+
+  socket.on('connect', function () {
+    setStatus('online', false);
+    join(); // il server risponde con il contenuto corrente -> riallineamento
+  });
+  socket.on('disconnect', function () { setStatus('offline - riconnessione...', true); });
+  socket.io.on('reconnect_attempt', function () { setStatus('riconnessione...', true); });
+  socket.on('content', render);
+  socket.on('force_reload', function (d) {
+    if (d && d.redirect) { window.location.href = d.redirect; }
+    else { window.location.reload(true); }
+  });
+
+  // overlay identificativo richiesto dalla regia (8s)
+  var identifyEl = document.getElementById('identify');
+  var identifyTimer = null;
+  socket.on('identify', function (d) {
+    if (!d) return;
+    identifyEl.querySelector('.id').textContent = d.device_id || DEVICE_ID;
+    identifyEl.querySelector('.nm').textContent = d.nome || '';
+    identifyEl.querySelector('.gr').textContent =
+      'Gruppo: ' + (d.gruppo || 'non_assegnato');
+    identifyEl.style.display = 'flex';
+    if (identifyTimer) clearTimeout(identifyTimer);
+    identifyTimer = setTimeout(function () {
+      identifyEl.style.display = 'none';
+    }, 8000);
+  });
+  socket.on('stato', function () {}); // broadcast admin: ignorato dal player
+
+  // primo render da payload server-side (evita flash nero)
+  render(INITIAL);
+
+  // ---- fullscreen al primo tocco/clic (tablet, touch, telecomando)
+  //      + sblocco audio: dopo un gesto utente le app in iframe
+  //      (es. Diretta News TV con mute=0) possono togliere il muto
+  function goFullscreen() {
+    if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+      document.documentElement.requestFullscreen().catch(function () {});
+    }
+  }
+  function unlockAudio() {
+    var fr = stage.querySelectorAll('iframe');
+    for (var i = 0; i < fr.length; i++) {
+      try { fr[i].contentWindow.postMessage({ type: 'unmute' }, '*'); }
+      catch (e) {}
+    }
+  }
+  document.addEventListener('click', function () {
+    goFullscreen(); unlockAudio();
+  });
+  document.addEventListener('touchend', function () {
+    goFullscreen(); unlockAudio();
+  });
+  document.addEventListener('keydown', unlockAudio);
+
+  // ---- refresh notturno anti memory-leak (04:00 locale)
+  function scheduleNightlyReload() {
+    var now = new Date();
+    var next = new Date(now);
+    next.setHours(4, 0, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    setTimeout(function () { window.location.reload(true); }, next - now);
+  }
+  scheduleNightlyReload();
+
+  // blocca menu contestuali / selezione su kiosk
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  document.addEventListener('selectstart', function (e) { e.preventDefault(); });
+})();
+</script>
+</body>
+</html>

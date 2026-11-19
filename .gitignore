@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Env / secrets
+.env
+
+# Stato runtime (auto-creato all'avvio da main.py)
+data/
+media/
+static/media/
+config.json
+
+# OS
+Thumbs.db
+.DS_Store

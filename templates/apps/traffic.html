@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Traffico Live</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden;
+               background: #0f172a; }
+  #map { width: 100vw; height: 100vh; border: 0; display: block; }
+  #badge {
+    position: fixed; top: 1.5vh; left: 1.5vw; z-index: 10;
+    background: rgba(15,23,42,.85); color: #f1f5f9;
+    font: 600 1.4vw "Segoe UI", system-ui, sans-serif;
+    padding: .8vh 1.4vw; border-radius: .6vw;
+    display: flex; align-items: center; gap: .6vw;
+    backdrop-filter: blur(4px);
+  }
+  #badge .dot { width: .9vw; height: .9vw; border-radius: 50%;
+                background: #22c55e; animation: pulse 2s infinite; }
+  @keyframes pulse { 50% { opacity: .4; } }
+  #msg {
+    display: none; position: fixed; inset: 0; z-index: 5;
+    align-items: center; justify-content: center; text-align: center;
+    color: #94a3b8; font: 500 2.4vw "Segoe UI", system-ui, sans-serif;
+  }
+</style>
+</head>
+<body>
+<div id="badge"><span class="dot"></span>Traffico Live</div>
+<iframe id="map" title="Mappa traffico"></iframe>
+<div id="msg">Coordinate mancanti: aggiungi ?lat=..&amp;lon=..&amp;zoom=..</div>
+<script>
+(function () {
+  'use strict';
+  var q = new URLSearchParams(location.search);
+  var LAT = q.get('lat'), LON = q.get('lon');
+  var ZOOM = q.get('zoom') || '13';
+  var RELOAD_MS = 5 * 60 * 1000;  // auto-refresh tile ogni 5 min
+
+  if (!LAT || !LON) {
+    document.getElementById('msg').style.display = 'flex';
+    document.getElementById('map').style.display = 'none';
+    return;
+  }
+  var f = document.getElementById('map');
+  function src() {
+    // Google Maps embed (no API key): layer=t = traffico real-time
+    return 'https://maps.google.com/maps?q=' + encodeURIComponent(LAT) +
+           ',' + encodeURIComponent(LON) +
+           '&z=' + encodeURIComponent(ZOOM) +
+           '&layer=t&hl=it&output=embed&_=' + Date.now();
+  }
+  f.src = src();
+  setInterval(function () { f.src = src(); }, RELOAD_MS);
+})();
+</script>
+</body>
+</html>

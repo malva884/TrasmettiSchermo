@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MB Screen</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script>
+/* Alpine component definito prima del caricamento di Alpine (defer) */
+function admin() {
+  return {
+    view: 'screens',
+    search: '',
+    connected: false,
+    stato: { gruppi: {}, clients: {}, media: [] },
+    assign: { open: false, target: 'all', url: '', mode: 'auto' },
+    tx: null,          // chiave asset con menu "Trasmetti" aperto
+    menu: null,        // gruppo con menu contestuale aperto
+    plGroup: '', plItems: [], dragIdx: null, urlInput: '',
+    toast: { show: false, msg: '', err: false },
+    upMsg: '', drop: false,
+    socket: null,
+    appTx: null,         // id app con menu Trasmetti aperto
+    appTypes: [
+      { tipo: 'clock',   nome: 'Orologio Aziendale',  icon: 'clock',
+        desc: 'Ora, data e intestazione personalizzata. Funziona anche offline.' },
+      { tipo: 'weather', nome: 'Meteo Locale',        icon: 'cloud-sun',
+        desc: 'Condizioni attuali e previsioni 3 giorni (Open-Meteo, cache 30 min).' },
+      { tipo: 'traffic', nome: 'Traffico Live',       icon: 'car-front',
+        desc: 'Mappa traffico in tempo reale, auto-refresh ogni 5 minuti.' },
+      { tipo: 'social',  nome: 'Social & Recensioni', icon: 'share-2',
+        desc: 'Embed widget Elfsight, SociableKIT, Juicer o feed custom.' },
+      { tipo: 'news_tv', nome: 'Diretta News TV',     icon: 'radio-tower',
+        desc: 'Sky TG24 o Rai News 24 a schermo intero, con badge LIVE.' },
+      { tipo: 'split',   nome: 'Split-Screen',        icon: 'columns-2',
+        desc: 'Contenuto principale 75% + barra laterale con widget.' },
+    ],
+    appModal: { open: false, tipo: '', id: '', nome: '', title: '', theme: 'dark',
+                show_seconds: true, city: '', lat: '', lon: '', zoom: 13,
+                main: '', side: '', html_snippet: '',
+                ntChannel: 'skytg24', ntAudio: false, ntStream: '',
+                geoResults: [], geoBusy: false },
+
+    init() {
+      this.socket = io({
+        transports: ["websocket", "polling"],
+        reconnection: true,
+        reconnectionDelay: 2000
+      });
+      this.socket.on('connect', () => { this.connected = true; });
+      this.socket.on('disconnect', () => { this.connected = false; });
+      this.socket.on('stato', s => { this.stato = s; this.icons(); });
+      this.icons();
+    },
+    icons() { setTimeout(() => { if (window.lucide) lucide.createIcons(); }, 0); },
+    setView(v) {
+      this.view = v; this.tx = null; this.menu = null;
+      if (v === 'playlist' && !this.plGroup) {
+        const ks = Object.keys(this.stato.gruppi);
+        if (ks.length) { this.plGroup = ks[0]; this.loadPlaylist(); }
+      }
+      this.icons();
+    },
+
+    /* ---------------- dati derivati ---------------- */
+    get groupNames() { return Object.keys(this.stato.gruppi); },
+    groups() {
+      const q = this.search.toLowerCase();
+      return this.groupNames
+        .filter(n => !q || n.toLowerCase().includes(q))
+        .map(n => [n, this.stato.gruppi[n]]);
+    },
+    clients(g) { return this.stato.clients[g] || 0; },
+    mediaFiles() {
+      const q = this.search.toLowerCase();
+      return (this.stato.media || []).filter(f => !q || f.toLowerCase().includes(q));
+    },
+    urlAssets() {
+      const set = {};
+      Object.values(this.stato.gruppi).forEach(g => {
+        if ((g.contenuto_attivo || '').startsWith('http')) set[g.contenuto_attivo] = 1;
+        (g.playlist || []).forEach(i => {
+          if ((i.url || '').startsWith('http')) set[i.url] = 1;
+        });
+      });
+      const q = this.search.toLowerCase();
+      return Object.keys(set).filter(u => !q || u.toLowerCase().includes(q));
+    },
+    /* ---------------- dispositivi ---------------- */
+    devices() {
+      const q = this.search.toLowerCase();
+      return Object.entries(this.stato.dispositivi || {})
+        .map(([id, d]) => ({
+          id: id, nome: d.nome || '', gruppo: d.gruppo || 'non_assegnato',
+          online: !!d.online, ultimo_visto: d.ultimo_visto || '',
+          contenuto: d.contenuto || null, user_agent: d.user_agent || ''
+        }))
+        .filter(d => !q || d.id.toLowerCase().includes(q) ||
+                     d.nome.toLowerCase().includes(q));
+    },
+    deviceUpdate(id, body) {
+      this.api('/api/dispositivi/' + encodeURIComponent(id), body)
+        .then(j => this.showToast(j.ok ? 'Dispositivo aggiornato' : (j.error || 'Errore'), !j.ok));
+    },
+    deviceAssign(d, val, el) {
+      if (val === '__new') {
+        const n = (prompt('Nome del nuovo gruppo:') || '').trim();
+        if (n) this.deviceUpdate(d.id, { gruppo: n });
+        else if (el) el.value = d.gruppo;
+        return;
+      }
+      this.deviceUpdate(d.id, { gruppo: val });
+    },
+    identifyDevice(id) {
+      this.api('/api/dispositivi/' + encodeURIComponent(id) + '/identify', {})
+        .then(j => this.showToast(j.ok ? 'Overlay su ' + id : (j.error || 'Errore'), !j.ok));
+    },
+    deviceReload(id) {
+      this.api('/api/reload', { dispositivi: [id] })
+        .then(() => this.showToast('Reload inviato a ' + id));
+    },
+    deviceDelete(id) {
+      if (!confirm('Eliminare il dispositivo ' + id + '?\n' +
+                   'Se torna online si re-registrera\' come nuovo nel gruppo "default".')) return;
+      fetch('/api/dispositivi/' + encodeURIComponent(id), { method: 'DELETE' })
+        .then(r => r.json())
+        .then(j => this.showToast(j.ok ? 'Dispositivo eliminato' : (j.error || 'Errore'), !j.ok));
+    },
+    clearDeviceContent(id) {
+      this.api('/api/dispositivi/' + encodeURIComponent(id) + '/contenuto', { url: null })
+        .then(j => this.showToast(j.ok ? 'Torna al feed del gruppo' : (j.error || 'Errore'), !j.ok));
+    },
+    devicePairing(id) {
+      if (!confirm('Ripristinare la schermata di attesa su ' + id + '?\n' +
+                   'Lo schermo mostrera\' il suo codice pairing, isolato dal feed del gruppo.')) return;
+      this.api('/api/dispositivi/' + encodeURIComponent(id) + '/contenuto', { type: 'none' })
+        .then(j => this.showToast(j.ok ? 'Schermata pairing su ' + id : (j.error || 'Errore'), !j.ok));
+    },
+    clearGroup(g) {
+      if (!confirm('Svuotare il gruppo "' + g + '"?\n' +
+                   'Contenuto e playlist verranno rimossi: gli schermi torneranno ' +
+                   'alla schermata di attesa con il codice pairing.')) return;
+      this.api('/api/contenuto', { gruppi: [g], url: '', mode: 'iframe' })
+        .then(j => this.showToast(j.ok ? 'Gruppo svuotato: ' + g : (j.error || 'Errore'), !j.ok));
+      this.menu = null;
+    },
+    nuovoGruppo() {
+      const n = (prompt('Nome del nuovo gruppo:') || '').trim();
+      if (!n) return;
+      this.api('/api/gruppi', { nome: n })
+        .then(j => this.showToast(j.ok ? 'Gruppo "' + n + '" creato' : (j.error || 'Errore'), !j.ok));
+    },
+    effContent(d) {
+      const own = d.contenuto || {};
+      if (own.tipo === 'idle' || own.tipo === 'none')
+        return { contenuto_attivo: '', tipo: 'idle', playlist: [] };
+      if (own.url) return { contenuto_attivo: own.url, tipo: own.tipo || 'url',
+                            mode: own.mode || 'iframe',
+                            ultimo_aggiornamento: own.ultimo_aggiornamento, playlist: [] };
+      return this.stato.gruppi[d.gruppo] || { contenuto_attivo: '', tipo: 'idle', playlist: [] };
+    },
+    groupTvs(g) {
+      let a = 0, o = 0;
+      Object.values(this.stato.dispositivi || {}).forEach(d => {
+        if ((d.gruppo || '') === g) { a++; if (d.online) o++; }
+      });
+      return [a, o];
+    },
+
+    mediaType(f) {
+      const e = f.split('.').pop().toLowerCase();
+      return ['mp4','webm','mov','m4v'].includes(e) ? 'video'
+           : ['jpg','jpeg','png','webp','gif','avif','svg'].includes(e) ? 'image' : 'file';
+    },
+    ytId(u) {
+      // video_id da watch?v=, youtu.be/, embed/, shorts/, live/, v/
+      const m = (u || '').match(
+        /(?:youtube(?:-nocookie)?\.com\/(?:watch\?[^#]*v=|embed\/|shorts\/|live\/|v\/)|youtu\.be\/)([\w-]{6,})/i);
+      return m ? m[1] : null;
+    },
+    isYt(u) {
+      return !!(this.ytId(u) || /[?&]list=[\w-]+/i.test(u || ''));
+    },
+    ytThumb(u) {
+      const id = this.ytId(u);
+      return id ? 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg' : '';
+    },
+    bust(url, ts) {
+      if (url && url.startsWith('/media/'))
+        return url + '?v=' + encodeURIComponent(ts || '');
+      return url;
+    },
+
+    /* ---------------- API ---------------- */
+    api(path, body, method) {
+      return fetch(path, {
+        method: method || 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined
+      }).then(r => r.json().then(j => { j._status = r.status; return j; }));
+    },
+    showToast(msg, err) {
+      this.toast = { show: true, msg: msg, err: !!err };
+      setTimeout(() => { this.toast.show = false; }, 2600);
+    },
+    send(url, target, mode) {
+      if (!url) { this.showToast('URL mancante', true); return; }
+      this.api('/api/contenuto', { gruppi: target || 'all', url: url, mode: mode || 'auto' })
+        .then(j => this.showToast(j.ok
+          ? 'In onda su: ' + (j.targets || []).join(', ')
+          : (j.error || 'Errore'), !j.ok));
+    },
+
+    /* ---------------- schermi ---------------- */
+    openAssign(target) {
+      this.assign = { open: true, target: target || 'all', device: null,
+                      url: '', mode: 'auto' };
+      this.menu = null; this.icons();
+    },
+    openAssignDevice(d) {
+      this.assign = { open: true, target: 'dev:' + d.id, device: d.id,
+                      url: '', mode: 'auto' };
+      this.menu = null; this.icons();
+    },
+    doAssign() {
+      const t = this.assign.target;
+      if (t && t.startsWith('dev:')) {
+        const id = t.slice(4);
+        this.api('/api/dispositivi/' + encodeURIComponent(id) + '/contenuto',
+                 { url: this.assign.url.trim(), mode: this.assign.mode })
+          .then(j => this.showToast(j.ok ? 'Contenuto dedicato su ' + id
+                                         : (j.error || 'Errore'), !j.ok));
+      } else {
+        this.send(this.assign.url.trim(), t, this.assign.mode);
+      }
+      this.assign.open = false;
+    },
+    forceReload(target) {
+      this.api('/api/reload', { gruppi: target || 'all' })
+        .then(j => this.showToast('Reload inviato a: ' + (j.targets || []).join(', ')));
+      this.menu = null;
+    },
+    copyLink(g) {
+      const u = location.origin + '/tv/' + g;
+      const done = () => this.showToast('Link copiato: ' + u);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(u).then(done).catch(() => this.showToast(u));
+      } else {
+        const t = document.createElement('textarea');
+        t.value = u; document.body.appendChild(t); t.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        t.remove(); done();
+      }
+      this.menu = null;
+    },
+    delGroup(g) {
+      if (!confirm('Eliminare il gruppo "' + g + '"?')) return;
+      fetch('/api/gruppo/' + encodeURIComponent(g), { method: 'DELETE' })
+        .then(r => r.json())
+        .then(j => this.showToast(j.ok ? 'Gruppo eliminato' : j.error, !j.ok));
+      if (this.plGroup === g) this.plGroup = '';
+      this.menu = null;
+    },
+    goPlaylist(g) { this.plGroup = g; this.loadPlaylist(); this.setView('playlist'); },
+
+    /* ---------------- assets ---------------- */
+    uploadFiles(files) {
+      const list = Array.prototype.slice.call(files);
+      if (!list.length) return;
+      let done = 0;
+      const step = () => {
+        if (done >= list.length) {
+          this.upMsg = 'Upload completato (' + list.length + ' file)';
+          setTimeout(() => { this.upMsg = ''; }, 3000);
+          return;
+        }
+        const f = list[done];
+        const fd = new FormData(); fd.append('file', f);
+        this.upMsg = 'Caricamento ' + (done + 1) + '/' + list.length + ': ' + f.name;
+        fetch('/api/upload', { method: 'POST', body: fd })
+          .then(r => r.json())
+          .then(j => {
+            if (!j.ok) this.showToast(f.name + ': ' + (j.error || 'errore'), true);
+            done++; step();
+          });
+      };
+      step();
+    },
+    delMedia(f) {
+      if (!confirm('Eliminare ' + f + '?')) return;
+      this.api('/api/media/delete', { file: f })
+        .then(j => this.showToast(j.ok ? 'Eliminato' : j.error, !j.ok));
+    },
+
+    /* ---------------- playlist ---------------- */
+    loadPlaylist() {
+      const g = this.stato.gruppi[this.plGroup];
+      this.plItems = g && g.playlist
+        ? g.playlist.map(i => ({ url: i.url, durata_sec: i.durata_sec })) : [];
+      this.icons();
+    },
+    plAdd(u) {
+      if (!u) { this.showToast('Inserisci un URL', true); return; }
+      this.plItems.push({ url: u, durata_sec: 15 });
+      this.icons();
+    },
+    plDrop(i) {
+      if (this.dragIdx === null || this.dragIdx === i) return;
+      const it = this.plItems.splice(this.dragIdx, 1)[0];
+      this.plItems.splice(i, 0, it);
+      this.dragIdx = null;
+    },
+    plTotal() {
+      return this.plItems.reduce((a, b) => a + (parseInt(b.durata_sec, 10) || 0), 0);
+    },
+    plStart() {
+      const items = this.plItems.filter(i => (i.url || '').trim());
+      if (!items.length) { this.showToast('Playlist vuota', true); return; }
+      this.api('/api/playlist', { gruppo: this.plGroup, playlist: items })
+        .then(j => this.showToast(j.ok ? 'Playlist avviata su ' + this.plGroup : j.error, !j.ok));
+    },
+    plStop() {
+      this.api('/api/playlist', { gruppo: this.plGroup, playlist: [] })
+        .then(() => this.showToast('Playlist fermata su ' + this.plGroup));
+    },
+
+    /* ---------------- app & widget ---------------- */
+    get savedApps() {
+      const q = this.search.toLowerCase();
+      return Object.entries(this.stato.app_configs || {})
+        .map(([id, a]) => ({ id: id, nome: a.nome || id, tipo: a.tipo || '',
+                             url: a.url || '', params: a.params || {},
+                             html_snippet: a.html_snippet || '' }))
+        .filter(a => !q || a.nome.toLowerCase().includes(q));
+    },
+    appIcon(t) { const c = this.appTypes.find(x => x.tipo === t);
+                 return c ? c.icon : 'app-window'; },
+    appTypeName(t) { const c = this.appTypes.find(x => x.tipo === t);
+                     return c ? c.nome : t; },
+    openAppModal(tipo, app) {
+      this.appModal = { open: true, tipo: tipo, id: '', nome: '',
+        title: '', theme: 'dark', show_seconds: true,
+        city: '', lat: '45.5416', lon: '10.2118', zoom: 13,
+        main: '', side: '', html_snippet: '',
+        ntChannel: 'skytg24', ntAudio: false,
+        ntStream: (this.stato.news_tv || {}).skytg24 || '',
+        geoResults: [], geoBusy: false };
+      if (app) {
+        const p = app.params || {};
+        this.appModal.id = app.id;
+        this.appModal.nome = app.nome || '';
+        this.appModal.title = p.title || '';
+        this.appModal.theme = p.theme || 'dark';
+        this.appModal.show_seconds = p.show_seconds !== 'false' && p.show_seconds !== false;
+        this.appModal.city = p.city || '';
+        this.appModal.lat = p.lat || '45.5416';
+        this.appModal.lon = p.lon || '10.2118';
+        this.appModal.zoom = parseInt(p.zoom, 10) || 13;
+        this.appModal.main = p.main || '';
+        this.appModal.side = p.side || '';
+        this.appModal.ntChannel = p.channel || 'skytg24';
+        // audio: parametro params.audio oppure mute= nell'URL salvato
+        // (default: muto)
+        const am = (app.url || '').match(/[?&]mute=(0|1)/);
+        this.appModal.ntAudio = p.audio === 'on' || p.audio === true ||
+          (!p.audio && !!am && am[1] === '0');
+        this.appModal.ntStream = p.stream ||
+          (this.stato.news_tv || {})[this.appModal.ntChannel] || '';
+        this.appModal.html_snippet = app.html_snippet || '';
+      }
+      this.icons();
+    },
+    appUrl() {
+      const m = this.appModal, e = encodeURIComponent;
+      if (m.tipo === 'clock') {
+        let u = '/apps/clock?theme=' + m.theme;
+        if (m.title) u += '&title=' + e(m.title);
+        if (m.show_seconds) u += '&show_seconds=1';
+        return u;
+      }
+      if (m.tipo === 'weather')
+        return '/apps/weather?lat=' + e(m.lat) + '&lon=' + e(m.lon) +
+               (m.city ? '&city=' + e(m.city) : '');
+      if (m.tipo === 'traffic')
+        return '/apps/traffic?lat=' + e(m.lat) + '&lon=' + e(m.lon) +
+               '&zoom=' + e(m.zoom);
+      if (m.tipo === 'social')
+        return m.id ? '/apps/social/' + m.id : '(URL assegnato al salvataggio)';
+      if (m.tipo === 'news_tv')
+        return '/apps/news_tv?channel=' + e(m.ntChannel) +
+               '&mute=' + (m.ntAudio ? '0' : '1');
+      if (m.tipo === 'split')
+        return '/apps/split?main=' + e(m.main) +
+               (m.side ? '&side=' + e(m.side) : '');
+      return '';
+    },
+    geocodeCity() {
+      const city = (this.appModal.city || '').trim();
+      if (!city) { this.showToast('Inserisci una citt\u00e0', true); return; }
+      this.appModal.geoBusy = true;
+      fetch('/api/apps/geocode?city=' + encodeURIComponent(city))
+        .then(r => r.json())
+        .then(j => {
+          this.appModal.geoBusy = false;
+          this.appModal.geoResults = j.results || [];
+          if (!this.appModal.geoResults.length)
+            this.showToast(j.error || 'Nessun risultato', true);
+        })
+        .catch(() => { this.appModal.geoBusy = false;
+                       this.showToast('Geocoding non raggiungibile', true); });
+    },
+    pickGeo(r) {
+      this.appModal.lat = r.lat; this.appModal.lon = r.lon;
+      this.appModal.city = r.name + (r.admin1 ? ', ' + r.admin1 : '');
+      this.appModal.geoResults = [];
+    },
+    saveApp() {
+      const m = this.appModal;
+      const body = { tipo: m.tipo,
+        nome: m.nome || m.title || m.city || this.appTypeName(m.tipo),
+        url: m.tipo === 'social' ? '' : this.appUrl(),
+        params: { title: m.title, theme: m.theme, show_seconds: m.show_seconds,
+                  city: m.city, lat: m.lat, lon: m.lon, zoom: m.zoom,
+                  main: m.main, side: m.side,
+                  channel: m.ntChannel, audio: m.ntAudio ? 'on' : 'off',
+                  stream: m.ntStream } };
+      if (m.id) body.id = m.id;
+      if (m.tipo === 'social') {
+        if (!m.html_snippet.trim()) {
+          this.showToast('Incolla il codice embed del widget', true); return;
+        }
+        body.html_snippet = m.html_snippet;
+      }
+      if (m.tipo === 'news_tv' && m.ntStream.trim()) {
+        // la sorgente diventa il default globale (state.news_tv -> config.json):
+        // vale per tutte le app News TV al prossimo caricamento pagina
+        const kv = {}; kv[m.ntChannel] = m.ntStream.trim();
+        this.api('/api/apps/news_tv', kv).then(j => {
+          if (!j.ok) this.showToast(j.error || 'Sorgente non salvata', true);
+        });
+      }
+      this.api('/api/apps', body).then(j => {
+        this.showToast(j.ok ? 'App salvata' : (j.error || 'Errore'), !j.ok);
+        if (j.ok) { this.appModal.open = false; }
+      });
+    },
+    delApp(id) {
+      if (!confirm('Eliminare questa app?')) return;
+      fetch('/api/apps/' + encodeURIComponent(id), { method: 'DELETE' })
+        .then(r => r.json())
+        .then(j => this.showToast(j.ok ? 'App eliminata' : (j.error || 'Errore'), !j.ok));
+    },
+    copyText(u) {
+      const done = () => this.showToast('Copiato: ' + u);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(u).then(done).catch(() => this.showToast(u));
+      } else { this.showToast(u); }
+    },
+    pvSrc(u) {
+      // preview admin: URL interni (/apps, /media) diretti, esterni via proxy
+      return (u || '').startsWith('/') ? u
+           : '/proxy?u=' + encodeURIComponent(u || '');
+    },
+
+    /* ---------------- topbar ---------------- */
+    get primaryLabel() {
+      return this.view === 'screens' ? '+ Trasmetti'
+           : this.view === 'groups' ? '+ Nuovo gruppo'
+           : this.view === 'assets' ? '+ Carica media'
+           : this.view === 'apps' ? '+ Nuovo widget social' : '+ Slide';
+    },
+    primaryAction() {
+      if (this.view === 'screens') this.openAssign('all');
+      else if (this.view === 'groups') this.nuovoGruppo();
+      else if (this.view === 'assets') this.$refs.fileInput.click();
+      else if (this.view === 'apps') this.openAppModal('social');
+      else { this.plItems.push({ url: '', durata_sec: 15 }); this.icons(); }
+    },
+    closeAll() { this.assign.open = false; this.appModal.open = false;
+                 this.tx = null; this.menu = null; this.appTx = null; }
+  };
+}
+</script>
+<script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<style>
+  [x-cloak] { display: none !important; }
+  .pv-frame {
+    width: 400%; height: 400%; border: 0; pointer-events: none;
+    transform: scale(.25); transform-origin: 0 0;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+
+<body class="bg-slate-950 text-slate-200 font-sans antialiased"
+      x-data="admin()" x-init="init()"
+      @keydown.escape.window="closeAll()">
+
+<div class="flex h-screen overflow-hidden">
+
+  <!-- ============================ SIDEBAR ============================ -->
+  <aside class="w-60 shrink-0 bg-slate-900 border-r border-slate-800 flex flex-col">
+    <div class="h-14 flex items-center gap-2 px-5 border-b border-slate-800">
+      <i data-lucide="monitor-play" class="w-5 h-5 text-indigo-400"></i>
+      <span class="font-bold tracking-tight">MB Screen</span>
+    </div>
+    <nav class="p-3 space-y-1 text-sm">
+      <button @click="setView('screens')"
+        :class="view==='screens' ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800'"
+        class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition">
+        <i data-lucide="monitor" class="w-4 h-4"></i> Schermi
+      </button>
+      <button @click="setView('groups')"
+        :class="view==='groups' ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800'"
+        class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition">
+        <i data-lucide="layers" class="w-4 h-4"></i> Gruppi
+      </button>
+      <button @click="setView('assets')"
+        :class="view==='assets' ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800'"
+        class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition">
+        <i data-lucide="folder-open" class="w-4 h-4"></i> Libreria Media
+      </button>
+      <button @click="setView('apps')"
+        :class="view==='apps' ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800'"
+        class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition">
+        <i data-lucide="layout-grid" class="w-4 h-4"></i> App &amp; Widget
+      </button>
+      <button @click="setView('playlist')"
+        :class="view==='playlist' ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800'"
+        class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition">
+        <i data-lucide="list-video" class="w-4 h-4"></i> Playlist
+      </button>
+    </nav>
+    <div class="mt-auto p-4 text-[11px] text-slate-600 border-t border-slate-800">
+      Digital Signage · LAN<br>Player: <span class="text-slate-400">/tv/&lt;gruppo&gt;</span>
+    </div>
+  </aside>
+
+  <!-- ============================ MAIN ============================ -->
+  <div class="flex-1 flex flex-col min-w-0">
+
+    <!-- TOPBAR -->
+    <header class="h-14 shrink-0 bg-slate-900/80 backdrop-blur border-b border-slate-800 flex items-center gap-4 px-5">
+      <div class="relative w-72 max-w-[40vw]">
+        <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500"></i>
+        <input x-model="search" type="text" placeholder="Cerca…"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-9 pr-3 py-1.5 text-sm
+                 focus:outline-none focus:border-indigo-500">
+      </div>
+      <div class="flex-1"></div>
+      <div class="flex items-center gap-2 text-xs"
+           :class="connected ? 'text-emerald-400' : 'text-red-400'">
+        <span class="w-2 h-2 rounded-full"
+              :class="connected ? 'bg-emerald-400' : 'bg-red-400 animate-pulse'"></span>
+        <span x-text="connected ? 'Server online' : 'Offline'"></span>
+      </div>
+      <button @click="primaryAction()"
+        class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium
+               px-4 py-1.5 rounded-lg transition flex items-center gap-1.5">
+        <i data-lucide="plus" class="w-4 h-4"></i><span x-text="primaryLabel"></span>
+      </button>
+    </header>
+
+    <!-- CONTENUTO -->
+    <main class="flex-1 overflow-y-auto p-5">
+
+      <!-- ==================== VISTA SCHERMI (device cards) ==================== -->
+      <section x-show="view==='screens'" x-cloak>
+        <div x-show="!devices().length" class="text-slate-500 text-sm py-16 text-center">
+          Nessun dispositivo registrato.<br>
+          Apri <b class="text-slate-300">/tv</b> su un client (Fire TV, Raspberry, PC)
+          per registrarlo automaticamente.
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4">
+          <template x-for="d in devices()" :key="d.id">
+            <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden
+                        hover:border-slate-600 transition">
+
+              <!-- preview 16:9 del contenuto effettivo sul device -->
+              <div class="relative aspect-video bg-black overflow-hidden">
+                <template x-if="effContent(d).tipo==='image'">
+                  <img :src="bust(effContent(d).contenuto_attivo, effContent(d).ultimo_aggiornamento)"
+                       class="w-full h-full object-cover" alt="">
+                </template>
+                <template x-if="effContent(d).tipo==='video'">
+                  <video :src="bust(effContent(d).contenuto_attivo, effContent(d).ultimo_aggiornamento)"
+                         muted playsinline preload="metadata"
+                         class="w-full h-full object-cover"></video>
+                </template>
+                <template x-if="effContent(d).tipo==='youtube'">
+                  <div class="w-full h-full flex items-center justify-center">
+                    <img x-show="ytThumb(effContent(d).contenuto_attivo)"
+                         :src="ytThumb(effContent(d).contenuto_attivo)"
+                         class="absolute inset-0 w-full h-full object-cover" alt="" loading="lazy">
+                    <i data-lucide="youtube" class="w-8 h-8 text-red-500"></i>
+                  </div>
+                </template>
+                <template x-if="effContent(d).tipo==='url' && effContent(d).contenuto_attivo">
+                  <iframe :src="pvSrc(effContent(d).contenuto_attivo)"
+                          class="pv-frame" loading="lazy" tabindex="-1"></iframe>
+                </template>
+                <template x-if="!effContent(d).tipo || effContent(d).tipo==='idle'">
+                  <div class="w-full h-full flex flex-col items-center justify-center text-slate-700">
+                    <i data-lucide="tv" class="w-8 h-8"></i>
+                    <span class="text-xs mt-2">In attesa di contenuti</span>
+                  </div>
+                </template>
+
+                <span x-show="d.online"
+                  class="absolute top-2 left-2 flex items-center gap-1 bg-emerald-500/90 text-white
+                         text-[10px] font-bold px-2 py-0.5 rounded-full">
+                  <span class="w-1.5 h-1.5 bg-white rounded-full animate-pulse"></span>LIVE
+                </span>
+                <span x-show="d.contenuto && d.contenuto.url"
+                  class="absolute top-2 right-2 bg-indigo-600/90 text-white
+                         text-[10px] px-2 py-0.5 rounded-full">dedicato</span>
+                <span x-show="d.contenuto && (d.contenuto.tipo==='idle' || d.contenuto.tipo==='none')"
+                  class="absolute top-2 right-2 bg-amber-600/90 text-white
+                         text-[10px] px-2 py-0.5 rounded-full">pairing</span>
+                <span class="absolute bottom-2 right-2 bg-slate-800/90 text-slate-300
+                             text-[10px] font-mono px-2 py-0.5 rounded-full" x-text="d.id"></span>
+              </div>
+
+              <!-- metadati + azioni -->
+              <div class="p-3">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0 flex-1">
+                    <input :value="d.nome" :placeholder="d.id"
+                      @change="deviceUpdate(d.id, { nome: $event.target.value })"
+                      class="w-full bg-transparent border-b border-transparent
+                             focus:border-indigo-500 text-sm font-semibold
+                             focus:outline-none py-0.5 truncate">
+                    <div class="text-xs text-slate-400 mt-0.5">
+                      <span :class="d.online ? 'text-emerald-400' : 'text-slate-500'"
+                            x-text="d.online ? 'Online' : 'Offline'"></span>
+                      · gruppo <b class="text-slate-300" x-text="d.gruppo"></b>
+                    </div>
+                  </div>
+                  <select :value="d.gruppo"
+                    @change="deviceAssign(d, $event.target.value, $event.target)"
+                    class="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-xs
+                           focus:outline-none focus:border-indigo-500 shrink-0 max-w-[45%]">
+                    <option value="non_assegnato">— non assegnato —</option>
+                    <template x-for="gn in groupNames" :key="'sg-'+gn">
+                      <option :value="gn" x-text="gn"></option>
+                    </template>
+                    <option value="__new">+ Nuovo gruppo…</option>
+                  </select>
+                </div>
+
+                <div class="flex items-center gap-1.5 mt-3">
+                  <button @click="identifyDevice(d.id)" title="Identifica schermo"
+                    class="flex-1 bg-slate-800 hover:bg-indigo-600 text-xs font-medium py-2
+                           rounded-lg transition flex items-center justify-center gap-1">
+                    <i data-lucide="scan-eye" class="w-3.5 h-3.5"></i> Identifica</button>
+                  <button @click="deviceReload(d.id)" title="Force reload"
+                    class="bg-slate-800 hover:bg-amber-700 text-xs font-medium py-2 px-2.5
+                           rounded-lg transition">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i></button>
+                  <button x-show="!d.online" @click="deviceDelete(d.id)"
+                    title="Elimina dispositivo offline"
+                    class="bg-slate-800 hover:bg-red-700 text-xs font-medium py-2 px-2.5
+                           rounded-lg transition">
+                    <i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                  <button @click="devicePairing(d.id)"
+                    title="Svuota / schermata pairing (mostra il codice del device)"
+                    class="bg-slate-800 hover:bg-amber-700 text-xs font-medium py-2 px-2.5
+                           rounded-lg transition">
+                    <i data-lucide="monitor-off" class="w-3.5 h-3.5"></i></button>
+                  <button @click="openAssignDevice(d)" title="Trasmetti solo qui"
+                    class="flex-1 bg-slate-800 hover:bg-indigo-600 text-xs font-medium py-2
+                           rounded-lg transition flex items-center justify-center gap-1">
+                    <i data-lucide="send" class="w-3.5 h-3.5"></i> Solo qui</button>
+                </div>
+                <button x-show="d.contenuto"
+                  @click="clearDeviceContent(d.id)"
+                  class="mt-1.5 w-full text-[11px] text-slate-500 hover:text-amber-300
+                         py-1 transition">
+                  ✕ rimuovi contenuto dedicato (torna al gruppo)
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </section>
+
+      <!-- ==================== VISTA GRUPPI ==================== -->
+      <section x-show="view==='groups'" x-cloak>
+        <div class="flex flex-wrap items-center gap-2 mb-4">
+          <button @click="nuovoGruppo()"
+            class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium
+                   px-3 py-2 rounded-lg transition flex items-center gap-1.5">
+            <i data-lucide="plus" class="w-3.5 h-3.5"></i> Nuovo Gruppo</button>
+          <button @click="openAssign('all')"
+            class="bg-slate-800 hover:bg-slate-700 text-xs font-medium
+                   px-3 py-2 rounded-lg transition flex items-center gap-1.5">
+            <i data-lucide="radio" class="w-3.5 h-3.5"></i> Broadcast a tutti</button>
+        </div>
+        <div x-show="!groupNames.length" class="text-slate-500 text-sm py-16 text-center">
+          Nessun gruppo configurato.<br>
+          Crea un gruppo con "+ Nuovo Gruppo" o apri <b class="text-slate-300">/tv</b> su un client.
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4">
+          <template x-for="g in groups()" :key="g[0]">
+            <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden
+                        hover:border-slate-600 transition group">
+
+              <!-- preview 16:9 -->
+              <div class="relative aspect-video bg-black overflow-hidden">
+                <template x-if="g[1].tipo==='image'">
+                  <img :src="bust(g[1].contenuto_attivo, g[1].ultimo_aggiornamento)"
+                       class="w-full h-full object-cover" alt="">
+                </template>
+                <template x-if="g[1].tipo==='video'">
+                  <video :src="bust(g[1].contenuto_attivo, g[1].ultimo_aggiornamento)"
+                         muted playsinline preload="metadata"
+                         class="w-full h-full object-cover"></video>
+                </template>
+                <template x-if="g[1].tipo==='youtube'">
+                  <div class="w-full h-full flex items-center justify-center">
+                    <img x-show="ytThumb(g[1].contenuto_attivo)"
+                         :src="ytThumb(g[1].contenuto_attivo)"
+                         class="absolute inset-0 w-full h-full object-cover" alt="" loading="lazy">
+                    <i data-lucide="youtube" class="w-8 h-8 text-red-500"></i>
+                  </div>
+                </template>
+                <template x-if="g[1].tipo==='url' && g[1].contenuto_attivo">
+                  <iframe :src="pvSrc(g[1].contenuto_attivo)"
+                          class="pv-frame" loading="lazy" tabindex="-1"></iframe>
+                </template>
+                <template x-if="!g[1].tipo || g[1].tipo==='idle'">
+                  <div class="w-full h-full flex flex-col items-center justify-center text-slate-700">
+                    <i data-lucide="monitor" class="w-8 h-8"></i>
+                    <span class="text-xs mt-2">In attesa di contenuti</span>
+                  </div>
+                </template>
+
+                <span x-show="clients(g[0]) > 0"
+                  class="absolute top-2 left-2 flex items-center gap-1 bg-emerald-500/90 text-white
+                         text-[10px] font-bold px-2 py-0.5 rounded-full">
+                  <span class="w-1.5 h-1.5 bg-white rounded-full animate-pulse"></span>LIVE
+                </span>
+                <span x-show="g[1].tipo==='url' && g[1].mode"
+                  class="absolute top-2 right-2 bg-slate-800/90 text-slate-300
+                         text-[10px] px-2 py-0.5 rounded-full" x-text="g[1].mode"></span>
+                <span x-show="g[1].playlist && g[1].playlist.length"
+                  class="absolute bottom-2 right-2 bg-amber-600/90 text-white
+                         text-[10px] px-2 py-0.5 rounded-full">
+                  playlist ×<span x-text="g[1].playlist.length"></span>
+                </span>
+              </div>
+
+              <!-- metadati + azioni -->
+              <div class="p-3">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="font-semibold text-sm truncate" x-text="g[0]"></div>
+                    <div class="text-xs text-slate-400 mt-0.5">
+                      <span x-text="groupTvs(g[0])[0]"></span> TV assegnate ·
+                      <span :class="groupTvs(g[0])[1] ? 'text-emerald-400' : 'text-slate-500'"
+                            x-text="groupTvs(g[0])[1]"></span> online
+                    </div>
+                  </div>
+                  <div class="relative shrink-0">
+                    <button @click="menu = (menu===g[0] ? null : g[0]); icons()"
+                      class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400">
+                      <i data-lucide="more-vertical" class="w-4 h-4"></i>
+                    </button>
+                    <div x-cloak x-show="menu===g[0]" @click.outside="menu=null"
+                      class="absolute right-0 top-9 z-20 w-44 bg-slate-800 border border-slate-700
+                             rounded-lg shadow-xl py-1 text-sm">
+                      <button @click="forceReload(g[0])"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
+                        <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i> Force reload</button>
+                      <button @click="copyLink(g[0])"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
+                        <i data-lucide="link" class="w-3.5 h-3.5"></i> Copia link player</button>
+                      <button @click="goPlaylist(g[0])"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
+                        <i data-lucide="list-video" class="w-3.5 h-3.5"></i> Modifica playlist</button>
+                      <button @click="clearGroup(g[0])"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
+                        <i data-lucide="monitor-off" class="w-3.5 h-3.5"></i> Svuota / Schermata pairing</button>
+                      <button @click="delGroup(g[0])"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 text-red-400 flex items-center gap-2">
+                        <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Elimina gruppo</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="text-xs text-slate-500 truncate mt-1"
+                     x-text="g[1].contenuto_attivo || '(nessun contenuto)'"></div>
+                <div x-show="g[1].mode==='redirect' && !clients(g[0])"
+                     class="text-[11px] text-red-400 mt-1">
+                  ⚠ redirect attivo: controllo remoto sospeso
+                </div>
+
+                <button @click="openAssign(g[0])"
+                  class="mt-3 w-full bg-slate-800 hover:bg-indigo-600 text-sm font-medium
+                         py-2 rounded-lg transition flex items-center justify-center gap-2">
+                  <i data-lucide="send" class="w-3.5 h-3.5"></i> Assegna contenuto
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </section>
+
+      <!-- ==================== VISTA LIBRERIA ==================== -->
+      <section x-show="view==='assets'" x-cloak>
+        <!-- dropzone -->
+        <div @dragover.prevent="drop=true" @dragleave.prevent="drop=false"
+             @drop.prevent="drop=false; uploadFiles($event.dataTransfer.files)"
+             @click="$refs.fileInput.click()"
+             :class="drop ? 'border-indigo-500 bg-indigo-600/10' : 'border-slate-700 hover:border-slate-500'"
+             class="border-2 border-dashed rounded-xl p-8 mb-2 text-center cursor-pointer transition">
+          <i data-lucide="cloud-upload" class="w-8 h-8 mx-auto text-slate-500"></i>
+          <div class="text-sm text-slate-400 mt-2">
+            Trascina qui immagini o video, oppure <span class="text-indigo-400">sfoglia</span>
+          </div>
+          <div class="text-[11px] text-slate-600 mt-1">mp4 · webm · mov · jpg · png · webp · gif · avif · svg</div>
+          <div class="text-xs text-indigo-300 mt-1" x-text="upMsg"></div>
+        </div>
+        <input x-ref="fileInput" type="file" multiple class="hidden"
+               accept=".mp4,.webm,.mov,.m4v,.jpg,.jpeg,.png,.webp,.gif,.avif,.svg"
+               @change="uploadFiles($event.target.files); $event.target.value=''">
+
+        <!-- file grid -->
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-6 gap-4 mt-4">
+          <template x-for="f in mediaFiles()" :key="f">
+            <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden
+                        hover:border-slate-600 transition">
+              <div class="relative aspect-video bg-black flex items-center justify-center overflow-hidden">
+                <template x-if="mediaType(f)==='image'">
+                  <img :src="'/media/'+f" class="w-full h-full object-cover" alt="" loading="lazy">
+                </template>
+                <template x-if="mediaType(f)==='video'">
+                  <video :src="'/media/'+f" muted playsinline preload="metadata"
+                         class="w-full h-full object-cover"></video>
+                </template>
+                <span class="absolute top-2 left-2 bg-slate-800/90 text-slate-300 text-[10px]
+                             px-2 py-0.5 rounded-full flex items-center gap-1">
+                  <i :data-lucide="mediaType(f)==='video' ? 'film' : 'image'" class="w-3 h-3"></i>
+                  <span x-text="mediaType(f)==='video' ? 'Video' : 'Immagine'"></span>
+                </span>
+              </div>
+              <div class="p-2.5">
+                <div class="text-xs truncate text-slate-300" x-text="f"></div>
+                <div class="flex items-center gap-1 mt-2">
+                  <div class="relative flex-1">
+                    <button @click="tx = (tx===f ? null : f); icons()"
+                      class="w-full bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white
+                             text-xs font-medium py-1.5 rounded-lg transition flex items-center justify-center gap-1">
+                      <i data-lucide="send" class="w-3 h-3"></i> Trasmetti
+                    </button>
+                    <div x-cloak x-show="tx===f" @click.outside="tx=null"
+                      class="absolute left-0 bottom-9 z-20 w-44 bg-slate-800 border border-slate-700
+                             rounded-lg shadow-xl py-1 text-xs">
+                      <button @click="send('/media/'+f, 'all'); tx=null"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 font-semibold text-indigo-300">
+                        Tutti (broadcast)</button>
+                      <template x-for="gn in groupNames" :key="gn">
+                        <button @click="send('/media/'+f, [gn]); tx=null"
+                          class="w-full text-left px-3 py-2 hover:bg-slate-700" x-text="gn"></button>
+                      </template>
+                    </div>
+                  </div>
+                  <button @click="delMedia(f)"
+                    class="p-1.5 rounded-lg hover:bg-red-900/40 text-slate-500 hover:text-red-400 transition">
+                    <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div x-show="!mediaFiles().length" class="text-slate-600 text-sm py-6 text-center">
+          Nessun file in libreria.
+        </div>
+
+        <!-- URL salvati -->
+        <div x-show="urlAssets().length" class="mt-8">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3 flex items-center gap-2">
+            <i data-lucide="globe" class="w-3.5 h-3.5"></i> Pagine web usate
+          </h3>
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            <template x-for="u in urlAssets()" :key="u">
+              <div class="bg-slate-900 border border-slate-800 rounded-xl p-3
+                          flex items-center gap-3 hover:border-slate-600 transition">
+                <div class="w-9 h-9 shrink-0 rounded-lg bg-slate-800 flex items-center justify-center">
+                  <i :data-lucide="isYt(u) ? 'youtube' : 'globe'"
+                     :class="isYt(u) ? 'w-4 h-4 text-red-400' : 'w-4 h-4 text-indigo-300'"></i>
+                </div>
+                <div class="min-w-0 flex-1 text-xs truncate text-slate-300" x-text="u"></div>
+                <button @click="send(u, 'all')"
+                  class="shrink-0 p-2 rounded-lg bg-indigo-600/20 hover:bg-indigo-600
+                         text-indigo-300 hover:text-white transition" title="Trasmetti a tutti">
+                  <i data-lucide="send" class="w-3.5 h-3.5"></i>
+                </button>
+              </div>
+            </template>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== VISTA APP & WIDGET ==================== -->
+      <section x-show="view==='apps'" x-cloak>
+        <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3">
+          Nuova app
+        </h3>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5 gap-4 mb-8">
+          <template x-for="c in appTypes" :key="c.tipo">
+            <button @click="openAppModal(c.tipo)"
+              class="text-left bg-slate-900 border border-slate-800 rounded-xl p-4
+                     hover:border-indigo-500 transition group">
+              <div class="w-10 h-10 rounded-lg bg-indigo-600/15 flex items-center justify-center
+                          group-hover:bg-indigo-600/30 transition">
+                <i :data-lucide="c.icon" class="w-5 h-5 text-indigo-300"></i>
+              </div>
+              <div class="font-semibold text-sm mt-3" x-text="c.nome"></div>
+              <div class="text-[11px] text-slate-500 mt-1 leading-snug" x-text="c.desc"></div>
+            </button>
+          </template>
+        </div>
+
+        <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3">
+          App salvate
+        </h3>
+        <div x-show="!savedApps.length" class="text-slate-600 text-sm py-6 text-center">
+          Nessuna app configurata — clicca una card qui sopra per crearne una.
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4">
+          <template x-for="a in savedApps" :key="a.id">
+            <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden
+                        hover:border-slate-600 transition">
+              <div class="relative aspect-video bg-black overflow-hidden">
+                <iframe :src="a.url" class="pv-frame" loading="lazy" tabindex="-1"></iframe>
+                <span class="absolute top-2 left-2 bg-slate-800/90 text-slate-300 text-[10px]
+                             px-2 py-0.5 rounded-full flex items-center gap-1">
+                  <i :data-lucide="appIcon(a.tipo)" class="w-3 h-3"></i>
+                  <span x-text="appTypeName(a.tipo)"></span>
+                </span>
+              </div>
+              <div class="p-2.5">
+                <div class="text-xs font-semibold truncate text-slate-200" x-text="a.nome"></div>
+                <div class="text-[10px] font-mono text-slate-500 truncate mt-0.5" x-text="a.url"></div>
+                <div class="flex items-center gap-1 mt-2">
+                  <div class="relative flex-1">
+                    <button @click="appTx = (appTx===a.id ? null : a.id); icons()"
+                      class="w-full bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white
+                             text-xs font-medium py-1.5 rounded-lg transition flex items-center justify-center gap-1">
+                      <i data-lucide="send" class="w-3 h-3"></i> Trasmetti
+                    </button>
+                    <div x-cloak x-show="appTx===a.id" @click.outside="appTx=null"
+                      class="absolute left-0 bottom-9 z-20 w-44 bg-slate-800 border border-slate-700
+                             rounded-lg shadow-xl py-1 text-xs">
+                      <button @click="send(a.url, 'all'); appTx=null"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 font-semibold text-indigo-300">
+                        Tutti (broadcast)</button>
+                      <template x-for="gn in groupNames" :key="'txapp-'+gn">
+                        <button @click="send(a.url, [gn]); appTx=null"
+                          class="w-full text-left px-3 py-2 hover:bg-slate-700" x-text="gn"></button>
+                      </template>
+                    </div>
+                  </div>
+                  <button @click="openAppModal(a.tipo, a)" title="Modifica"
+                    class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-indigo-300 transition">
+                    <i data-lucide="pencil" class="w-3.5 h-3.5"></i>
+                  </button>
+                  <button @click="copyText(location.origin + a.url)" title="Copia URL"
+                    class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-indigo-300 transition">
+                    <i data-lucide="link" class="w-3.5 h-3.5"></i>
+                  </button>
+                  <button @click="delApp(a.id)" title="Elimina"
+                    class="p-1.5 rounded-lg hover:bg-red-900/40 text-slate-500 hover:text-red-400 transition">
+                    <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </section>
+
+      <!-- ==================== VISTA PLAYLIST ==================== -->
+      <section x-show="view==='playlist'" x-cloak>
+        <div x-show="!groupNames.length" class="text-slate-500 text-sm py-16 text-center">
+          Crea prima un gruppo aprendo <b class="text-slate-300">/tv/&lt;nome&gt;</b> su un client.
+        </div>
+
+        <div x-show="groupNames.length" class="flex flex-col lg:flex-row gap-4 items-start">
+
+          <!-- colonna sinistra: asset disponibili -->
+          <div class="w-full lg:w-80 shrink-0 bg-slate-900 border border-slate-800 rounded-xl p-3">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2 px-1">
+              Asset disponibili
+            </h3>
+            <div class="flex gap-2 mb-2">
+              <input x-model="urlInput" type="text" placeholder="https://… · YouTube · /media/file"
+                @keydown.enter="plAdd(urlInput.trim()); urlInput=''"
+                class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs
+                       focus:outline-none focus:border-indigo-500">
+              <button @click="plAdd(urlInput.trim()); urlInput=''"
+                class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 rounded-lg transition">
+                <i data-lucide="plus" class="w-3.5 h-3.5"></i></button>
+            </div>
+            <div class="max-h-[60vh] overflow-y-auto space-y-1">
+              <template x-for="f in mediaFiles()" :key="'pa-'+f">
+                <div class="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-slate-800 text-xs group">
+                  <i :data-lucide="mediaType(f)==='video' ? 'film' : 'image'"
+                     class="w-3.5 h-3.5 text-slate-500 shrink-0"></i>
+                  <span class="flex-1 truncate text-slate-300" x-text="f"></span>
+                  <button @click="plAdd('/media/'+f)"
+                    class="opacity-0 group-hover:opacity-100 text-indigo-400 hover:text-indigo-300 transition">
+                    <i data-lucide="plus-circle" class="w-4 h-4"></i></button>
+                </div>
+              </template>
+              <div x-show="!mediaFiles().length" class="text-slate-600 text-xs px-2 py-3">
+                Libreria vuota — carica file dalla vista Libreria.
+              </div>
+              <div x-show="savedApps.length"
+                class="px-1 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                App salvate
+              </div>
+              <template x-for="a in savedApps" :key="'papp-'+a.id">
+                <div class="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-slate-800 text-xs group">
+                  <i :data-lucide="appIcon(a.tipo)" class="w-3.5 h-3.5 text-slate-500 shrink-0"></i>
+                  <span class="flex-1 truncate text-slate-300" x-text="a.nome"></span>
+                  <button @click="plAdd(a.url)"
+                    class="opacity-0 group-hover:opacity-100 text-indigo-400 hover:text-indigo-300 transition">
+                    <i data-lucide="plus-circle" class="w-4 h-4"></i></button>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- colonna destra: coda playlist -->
+          <div class="flex-1 min-w-0 bg-slate-900 border border-slate-800 rounded-xl p-3 w-full">
+            <div class="flex flex-wrap items-center gap-3 mb-3 px-1">
+              <select x-model="plGroup" @change="loadPlaylist()"
+                class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm
+                       focus:outline-none focus:border-indigo-500">
+                <template x-for="gn in groupNames" :key="'sel-'+gn">
+                  <option :value="gn" x-text="gn"></option>
+                </template>
+              </select>
+              <span x-show="stato.gruppi[plGroup] && stato.gruppi[plGroup].playlist
+                            && stato.gruppi[plGroup].playlist.length"
+                class="text-[11px] bg-amber-600/20 text-amber-300 px-2 py-0.5 rounded-full">
+                attiva ×<span x-text="((stato.gruppi[plGroup] || {}).playlist || []).length"></span>
+              </span>
+              <div class="flex-1"></div>
+              <span class="text-xs text-slate-400 flex items-center gap-1.5">
+                <i data-lucide="clock" class="w-3.5 h-3.5"></i>
+                Loop totale: <b x-text="plTotal()"></b>s
+              </span>
+              <button @click="plStart()"
+                class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium
+                       px-3 py-1.5 rounded-lg transition flex items-center gap-1.5">
+                <i data-lucide="play" class="w-3.5 h-3.5"></i> Avvia</button>
+              <button @click="plStop()"
+                class="bg-slate-800 hover:bg-slate-700 text-xs font-medium
+                       px-3 py-1.5 rounded-lg transition flex items-center gap-1.5">
+                <i data-lucide="square" class="w-3.5 h-3.5"></i> Ferma</button>
+            </div>
+
+            <div class="space-y-1.5 max-h-[62vh] overflow-y-auto">
+              <template x-for="(it, i) in plItems" :key="i">
+                <div draggable="true" @dragstart="dragIdx=i" @dragover.prevent @drop="plDrop(i)"
+                  class="flex items-center gap-2 bg-slate-800/70 border border-slate-800
+                         rounded-lg px-2 py-1.5">
+                  <i data-lucide="grip-vertical" class="w-4 h-4 text-slate-600 cursor-grab shrink-0"></i>
+                  <span class="text-[11px] text-slate-500 w-5 text-center shrink-0" x-text="i+1"></span>
+                  <i x-show="isYt(it.url)" data-lucide="youtube"
+                     class="w-4 h-4 text-red-400 shrink-0" title="YouTube"></i>
+                  <input type="text" x-model="it.url" placeholder="URL o /media/file"
+                    class="flex-1 min-w-0 bg-transparent border-b border-transparent
+                           focus:border-indigo-500 text-xs py-1 focus:outline-none">
+                  <input type="number" x-model.number="it.durata_sec" min="0"
+                    :title="isYt(it.url) ? 'durata (s) — 0 = a fine video' : 'durata (s)'"
+                    class="w-16 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-center
+                           focus:outline-none focus:border-indigo-500">
+                  <span class="text-[11px] text-slate-500 shrink-0">s</span>
+                  <button @click="plItems.splice(i,1)"
+                    class="p-1 text-slate-600 hover:text-red-400 transition shrink-0">
+                    <i data-lucide="x" class="w-3.5 h-3.5"></i></button>
+                </div>
+              </template>
+              <div x-show="!plItems.length" class="text-slate-600 text-xs text-center py-8">
+                Coda vuota — aggiungi asset dalla colonna sinistra.
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- ==================== MODALE ASSEGNA CONTENUTO ==================== -->
+<div x-cloak x-show="assign.open" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+  <div class="absolute inset-0 bg-black/70" @click="assign.open=false"></div>
+  <div class="relative w-full max-w-lg bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-5">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-semibold">Assegna contenuto</h2>
+      <button @click="assign.open=false" class="p-1 text-slate-500 hover:text-white">
+        <i data-lucide="x" class="w-4 h-4"></i></button>
+    </div>
+
+    <label class="block text-xs text-slate-400 mb-1">Destinatario</label>
+    <select x-model="assign.target"
+      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+             focus:outline-none focus:border-indigo-500">
+      <option x-show="assign.device" :value="'dev:'+assign.device"
+              x-text="'Solo questo schermo: ' + assign.device"></option>
+      <option value="all">Tutti gli schermi (broadcast)</option>
+      <template x-for="gn in groupNames" :key="'at-'+gn">
+        <option :value="gn" x-text="gn"></option>
+      </template>
+    </select>
+    <div x-show="assign.device" class="text-[11px] text-indigo-300 -mt-1 mb-3">
+      Contenuto dedicato: il device esce dal feed del gruppo finché non lo rimuovi.
+    </div>
+
+    <label class="block text-xs text-slate-400 mb-1">URL / percorso media</label>
+    <input x-model="assign.url" type="text" placeholder="https://… oppure /media/file.jpg"
+      @keydown.enter="doAssign()"
+      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+             focus:outline-none focus:border-indigo-500">
+
+    <label class="block text-xs text-slate-400 mb-1">Modalità pagina web</label>
+    <select x-model="assign.mode"
+      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-4
+             focus:outline-none focus:border-indigo-500">
+      <option value="auto">Auto (rilevamento server)</option>
+      <option value="iframe">Iframe diretto</option>
+      <option value="proxy">Iframe via proxy</option>
+      <option value="redirect">Redirect (perde controllo remoto)</option>
+    </select>
+
+    <div x-show="savedApps.length">
+      <label class="block text-xs text-slate-400 mb-1">App salvate</label>
+      <div class="flex flex-wrap gap-1.5 mb-3">
+        <template x-for="a in savedApps" :key="'as-'+a.id">
+          <button @click="assign.url=a.url"
+            :class="assign.url===a.url ? 'border-indigo-500 bg-indigo-600/20 text-indigo-200' : 'border-slate-700 bg-slate-800 text-slate-300'"
+            class="border rounded-lg px-2.5 py-1.5 text-xs flex items-center gap-1.5
+                   hover:border-indigo-400 transition">
+            <i :data-lucide="appIcon(a.tipo)" class="w-3 h-3"></i>
+            <span x-text="a.nome"></span>
+          </button>
+        </template>
+      </div>
+    </div>
+
+    <label class="block text-xs text-slate-400 mb-1">Oppure scegli dalla libreria</label>
+    <div class="grid grid-cols-3 gap-2 max-h-40 overflow-y-auto mb-4">
+      <template x-for="f in mediaFiles()" :key="'am-'+f">
+        <button @click="assign.url='/media/'+f"
+          :class="assign.url==='/media/'+f ? 'border-indigo-500' : 'border-slate-700'"
+          class="border rounded-lg overflow-hidden bg-black aspect-video
+                 flex items-center justify-center hover:border-indigo-400 transition">
+          <template x-if="mediaType(f)==='image'">
+            <img :src="'/media/'+f" class="w-full h-full object-cover" alt="">
+          </template>
+          <template x-if="mediaType(f)!=='image'">
+            <i :data-lucide="mediaType(f)==='video' ? 'film' : 'file'"
+               class="w-5 h-5 text-slate-500"></i>
+          </template>
+        </button>
+      </template>
+    </div>
+
+    <div class="flex justify-end gap-2">
+      <button @click="assign.open=false"
+        class="px-4 py-2 text-sm rounded-lg bg-slate-800 hover:bg-slate-700 transition">Annulla</button>
+      <button @click="doAssign()"
+        class="px-4 py-2 text-sm rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white
+               font-medium transition flex items-center gap-1.5">
+        <i data-lucide="send" class="w-3.5 h-3.5"></i> Metti in onda</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== MODALE CONFIGURA APP ==================== -->
+<div x-cloak x-show="appModal.open" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+  <div class="absolute inset-0 bg-black/70" @click="appModal.open=false"></div>
+  <div class="relative w-full max-w-lg bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-5
+              max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-semibold flex items-center gap-2">
+        <i :data-lucide="appIcon(appModal.tipo)" class="w-4 h-4 text-indigo-300"></i>
+        <span x-text="appTypeName(appModal.tipo)"></span>
+      </h2>
+      <button @click="appModal.open=false" class="p-1 text-slate-500 hover:text-white">
+        <i data-lucide="x" class="w-4 h-4"></i></button>
+    </div>
+
+    <label class="block text-xs text-slate-400 mb-1">Nome app (etichetta in elenco)</label>
+    <input x-model="appModal.nome" type="text" placeholder="Es. Meteo Brescia"
+      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+             focus:outline-none focus:border-indigo-500">
+
+    <!-- campi: OROLOGIO -->
+    <template x-if="appModal.tipo==='clock'">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Titolo intestazione</label>
+        <input x-model="appModal.title" type="text" placeholder="Metallurgica Bresciana Srl"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+                 focus:outline-none focus:border-indigo-500">
+        <label class="block text-xs text-slate-400 mb-1">Tema</label>
+        <select x-model="appModal.theme"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+                 focus:outline-none focus:border-indigo-500">
+          <option value="dark">Scuro</option>
+          <option value="light">Chiaro</option>
+        </select>
+        <label class="flex items-center gap-2 text-sm text-slate-300 mb-3">
+          <input type="checkbox" x-model="appModal.show_seconds"
+            class="rounded bg-slate-800 border-slate-600"> Mostra i secondi
+        </label>
+      </div>
+    </template>
+
+    <!-- campi: METEO / TRAFFICO (geocoding condiviso) -->
+    <template x-if="appModal.tipo==='weather' || appModal.tipo==='traffic'">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Citt&agrave;</label>
+        <div class="flex gap-2 mb-1">
+          <input x-model="appModal.city" type="text" placeholder="Brescia"
+            @keydown.enter="geocodeCity()"
+            class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm
+                   focus:outline-none focus:border-indigo-500">
+          <button @click="geocodeCity()" :disabled="appModal.geoBusy"
+            class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium
+                   px-3 rounded-lg transition flex items-center gap-1.5 disabled:opacity-50">
+            <i data-lucide="map-pin" class="w-3.5 h-3.5"></i>
+            <span x-text="appModal.geoBusy ? 'Ricerca…' : 'Cerca'"></span>
+          </button>
+        </div>
+        <div x-show="appModal.geoResults.length"
+          class="mb-2 bg-slate-800 border border-slate-700 rounded-lg overflow-hidden text-xs">
+          <template x-for="r in appModal.geoResults" :key="r.lat+'_'+r.lon">
+            <button @click="pickGeo(r)"
+              class="w-full text-left px-3 py-2 hover:bg-slate-700 flex justify-between gap-2">
+              <span x-text="r.name + (r.admin1 ? ', ' + r.admin1 : '') + (r.country ? ' (' + r.country + ')' : '')"></span>
+              <span class="text-slate-500 font-mono" x-text="r.lat + ', ' + r.lon"></span>
+            </button>
+          </template>
+        </div>
+        <div class="grid grid-cols-3 gap-2 mb-3">
+          <div>
+            <label class="block text-[11px] text-slate-500 mb-1">Latitudine</label>
+            <input x-model="appModal.lat" type="text"
+              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono
+                     focus:outline-none focus:border-indigo-500">
+          </div>
+          <div>
+            <label class="block text-[11px] text-slate-500 mb-1">Longitudine</label>
+            <input x-model="appModal.lon" type="text"
+              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono
+                     focus:outline-none focus:border-indigo-500">
+          </div>
+          <div x-show="appModal.tipo==='traffic'">
+            <label class="block text-[11px] text-slate-500 mb-1">Zoom (3-20)</label>
+            <input x-model.number="appModal.zoom" type="number" min="3" max="20"
+              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs
+                     focus:outline-none focus:border-indigo-500">
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- campi: SOCIAL -->
+    <template x-if="appModal.tipo==='social'">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">
+          Codice embed widget (Elfsight, SociableKIT, Juicer…)
+        </label>
+        <textarea x-model="appModal.html_snippet" rows="6" spellcheck="false"
+          placeholder='<script src="..."></script><div class="..."></div>'
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono mb-1
+                 focus:outline-none focus:border-indigo-500"></textarea>
+        <div class="text-[11px] text-amber-300/80 mb-3">
+          Il codice viene renderizzato a schermo intero su /apps/social/&lt;id&gt;
+          con auto-reload ogni 15 minuti.
+        </div>
+      </div>
+    </template>
+
+    <!-- campi: NEWS TV -->
+    <template x-if="appModal.tipo==='news_tv'">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Canale</label>
+        <select x-model="appModal.ntChannel"
+          @change="appModal.ntStream=(stato.news_tv||{})[appModal.ntChannel]||''"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+                 focus:outline-none focus:border-indigo-500">
+          <option value="skytg24">Sky TG24</option>
+          <option value="rainews24">Rai News 24</option>
+        </select>
+        <label class="block text-xs text-slate-400 mb-1">Audio</label>
+        <select x-model="appModal.ntAudio"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+                 focus:outline-none focus:border-indigo-500">
+          <option :value="false">Muto (consigliato — garantisce autoplay)</option>
+          <option :value="true">Audio attivo (richiede interazione sul browser)</option>
+        </select>
+        <label class="block text-xs text-slate-400 mb-1"
+          x-text="appModal.ntChannel==='skytg24'
+                  ? 'Sorgente — URL .m3u8 (consigliato) o ID video/canale YouTube'
+                  : 'Sorgente — URL playlist .m3u8'"></label>
+        <input x-model="appModal.ntStream" type="text" spellcheck="false"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs
+                 font-mono mb-1 focus:outline-none focus:border-indigo-500">
+        <div class="text-[11px] text-slate-500 mb-3">
+          Salvata come sorgente di default per <b>tutte</b> le app News TV
+          (in <code>config.json</code>): aggiornarla qui se l'emittente cambia indirizzo.
+          Gli stream .m3u8 (Sky TG24 e Rai News 24) vengono riprodotti
+          nel browser del player via HLS — usano l'IP italiano della sede,
+          niente blocchi di incorporamento né geografici del server.
+        </div>
+      </div>
+    </template>
+
+    <!-- campi: SPLIT-SCREEN -->
+    <template x-if="appModal.tipo==='split'">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">
+          Area principale (75%) — video, immagine, app o pagina
+        </label>
+        <input x-model="appModal.main" type="text" list="dl-main" placeholder="/media/video.mp4"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+                 focus:outline-none focus:border-indigo-500">
+        <datalist id="dl-main">
+          <template x-for="f in mediaFiles()" :key="'dm-'+f">
+            <option :value="'/media/'+f"></option>
+          </template>
+          <template x-for="a in savedApps" :key="'dmain-'+a.id">
+            <option :value="a.url" x-text="a.nome"></option>
+          </template>
+        </datalist>
+        <label class="block text-xs text-slate-400 mb-1">
+          Barra laterale (25%) — app o widget verticale
+        </label>
+        <input x-model="appModal.side" type="text" list="dl-side" placeholder="/apps/clock?theme=dark"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-1
+                 focus:outline-none focus:border-indigo-500">
+        <datalist id="dl-side">
+          <option value="/apps/clock?theme=dark"></option>
+          <template x-for="a in savedApps" :key="'dside-'+a.id">
+            <option :value="a.url" x-text="a.nome"></option>
+          </template>
+        </datalist>
+        <div class="text-[11px] text-slate-500 mb-3">
+          Lascia vuoto per usare l'intero schermo per l'area principale.
+        </div>
+      </div>
+    </template>
+
+    <label class="block text-xs text-slate-400 mb-1">URL generato</label>
+    <div class="flex gap-2 mb-4">
+      <input :value="appUrl()" readonly
+        class="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono
+               text-indigo-300 truncate">
+      <button @click="copyText(appUrl())" title="Copia URL"
+        class="bg-slate-800 hover:bg-slate-700 px-3 rounded-lg transition">
+        <i data-lucide="link" class="w-3.5 h-3.5"></i></button>
+      <button x-show="appModal.tipo!=='social' || appModal.id" @click="window.open(appUrl(), '_blank')"
+        title="Anteprima" class="bg-slate-800 hover:bg-slate-700 px-3 rounded-lg transition">
+        <i data-lucide="external-link" class="w-3.5 h-3.5"></i></button>
+    </div>
+
+    <div class="flex justify-end gap-2">
+      <button @click="appModal.open=false"
+        class="px-4 py-2 text-sm rounded-lg bg-slate-800 hover:bg-slate-700 transition">Annulla</button>
+      <button @click="saveApp()"
+        class="px-4 py-2 text-sm rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white
+               font-medium transition flex items-center gap-1.5">
+        <i data-lucide="save" class="w-3.5 h-3.5"></i> Salva App</button>
+    </div>
+  </div>
+</div>
+
+<!-- toast -->
+<div x-cloak x-show="toast.show" x-transition
+  :class="toast.err ? 'bg-red-900/90 text-red-200' : 'bg-emerald-900/90 text-emerald-200'"
+  class="fixed bottom-5 left-1/2 -translate-x-1/2 px-5 py-2.5 rounded-lg text-sm shadow-xl z-50
+         max-w-[90vw] truncate" x-text="toast.msg"></div>
+
+</body>
+</html>

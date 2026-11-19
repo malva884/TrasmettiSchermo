@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Meteo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden;
+               font-family: "Segoe UI", system-ui, sans-serif;
+               color: #f1f5f9; }
+  body {
+    background: linear-gradient(160deg, #0c4a6e 0%, #0f172a 55%, #020617 100%);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+  }
+  #city { font-size: 3vw; font-weight: 600; letter-spacing: .1em;
+          text-transform: uppercase; opacity: .75; }
+  #icon { width: 16vw; height: 16vw; margin: 1vh 0; }
+  #temp { font-size: 11vw; font-weight: 800; line-height: 1;
+          font-variant-numeric: tabular-nums; }
+  #desc { font-size: 3.4vw; font-weight: 500; opacity: .9;
+          text-transform: capitalize; }
+  #meta { display: flex; gap: 4vw; margin-top: 2.5vh;
+          font-size: 2.4vw; opacity: .85; }
+  #meta b { font-weight: 700; }
+  #days { display: flex; gap: 3vw; margin-top: 4vh; }
+  .day {
+    background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.12);
+    border-radius: 1.2vw; padding: 1.6vh 2.2vw; min-width: 13vw;
+    backdrop-filter: blur(6px);
+  }
+  .day .d { font-size: 1.8vw; text-transform: uppercase; opacity: .7;
+            letter-spacing: .08em; }
+  .day svg { width: 5vw; height: 5vw; margin: .8vh 0; }
+  .day .mm { font-size: 2.2vw; font-variant-numeric: tabular-nums; }
+  .day .mm .lo { opacity: .55; }
+  #stale {
+    position: fixed; bottom: 2vh; right: 2vw; font-size: 1.1vw;
+    background: rgba(0,0,0,.5); border: 1px solid rgba(251,191,36,.5);
+    color: #fbbf24; padding: .5vh 1vw; border-radius: 999px; display: none;
+  }
+  #msg { display: none; font-size: 3vw; opacity: .8; max-width: 80vw; }
+
+  /* ---- icone animate ---- */
+  .spin { transform-origin: center; animation: spin 24s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .drift { animation: drift 5s ease-in-out infinite alternate; }
+  @keyframes drift { from { transform: translateX(-4%); }
+                     to { transform: translateX(4%); } }
+  .drop { animation: drop 1.4s linear infinite; }
+  .drop.d2 { animation-delay: .45s; } .drop.d3 { animation-delay: .9s; }
+  @keyframes drop { 0% { transform: translateY(0); opacity: 1; }
+                    80% { opacity: 1; }
+                    100% { transform: translateY(140%); opacity: 0; } }
+  .flake { animation: drop 2.6s linear infinite; }
+  .flake.d2 { animation-delay: .85s; } .flake.d3 { animation-delay: 1.7s; }
+  .bolt { animation: bolt 2.2s ease-in-out infinite; }
+  @keyframes bolt { 0%, 55%, 100% { opacity: .25; }
+                    10%, 30% { opacity: 1; } }
+</style>
+</head>
+<body>
+<div id="msg">Meteo non disponibile — nuovo tentativo a breve&hellip;</div>
+<div id="wrap" style="display:none">
+  <div id="city"></div>
+  <div id="icon"></div>
+  <div id="temp"></div>
+  <div id="desc"></div>
+  <div id="meta">
+    <span>Min <b id="tmin"></b>° · Max <b id="tmax"></b>°</span>
+    <span>Vento <b id="wind"></b> km/h</span>
+  </div>
+  <div id="days"></div>
+</div>
+<div id="stale"></div>
+
+<script>
+(function () {
+  'use strict';
+  var q = new URLSearchParams(location.search);
+  var CITY = q.get('city') || '';
+  var LAT = q.get('lat'), LON = q.get('lon');
+
+  // WMO weather_code -> [descrizione, tipo icona]
+  var WMO = {
+    0:['Sereno','sun'], 1:['Prevalentemente sereno','sun'],
+    2:['Parzialmente nuvoloso','sun-cloud'], 3:['Coperto','cloud'],
+    45:['Nebbia','fog'], 48:['Nebbia','fog'],
+    51:['Pioviggine','drizzle'], 53:['Pioviggine','drizzle'],
+    55:['Pioviggine intensa','drizzle'],
+    56:['Pioviggine gelata','drizzle'], 57:['Pioviggine gelata','drizzle'],
+    61:['Pioggia debole','rain'], 63:['Pioggia','rain'],
+    65:['Pioggia intensa','rain'],
+    66:['Pioggia gelata','rain'], 67:['Pioggia gelata','rain'],
+    71:['Neve debole','snow'], 73:['Neve','snow'], 75:['Neve intensa','snow'],
+    77:['Neve','snow'],
+    80:['Rovesci deboli','rain'], 81:['Rovesci','rain'],
+    82:['Rovesci intensi','rain'],
+    85:['Rovesci di neve','snow'], 86:['Rovesci di neve','snow'],
+    95:['Temporale','storm'], 96:['Temporale con grandine','storm'],
+    99:['Temporale con grandine','storm']
+  };
+
+  var SUN = '<circle cx="50" cy="50" r="18" fill="#fbbf24"/>' +
+    '<g class="spin" stroke="#fbbf24" stroke-width="5" stroke-linecap="round">' +
+    '<line x1="50" y1="12" x2="50" y2="24"/><line x1="50" y1="76" x2="50" y2="88"/>' +
+    '<line x1="12" y1="50" x2="24" y2="50"/><line x1="76" y1="50" x2="88" y2="50"/>' +
+    '<line x1="23" y1="23" x2="31" y2="31"/><line x1="69" y1="69" x2="77" y2="77"/>' +
+    '<line x1="23" y1="77" x2="31" y2="69"/><line x1="69" y1="31" x2="77" y2="23"/></g>';
+  var CLOUD = '<g class="drift" fill="#cbd5e1">' +
+    '<ellipse cx="50" cy="62" rx="26" ry="14"/>' +
+    '<circle cx="38" cy="54" r="13"/><circle cx="58" cy="50" r="16"/></g>';
+  var DROPS = '<g fill="#7dd3fc">' +
+    '<circle class="drop" cx="38" cy="78" r="3.4"/>' +
+    '<circle class="drop d2" cx="52" cy="78" r="3.4"/>' +
+    '<circle class="drop d3" cx="66" cy="78" r="3.4"/></g>';
+  var FLAKES = '<g fill="#e0f2fe" font-size="13" text-anchor="middle">' +
+    '<text class="flake" x="38" y="82">&#10052;</text>' +
+    '<text class="flake d2" x="52" y="82">&#10052;</text>' +
+    '<text class="flake d3" x="66" y="82">&#10052;</text></g>';
+  var BOLT = '<polygon class="bolt" points="52,66 42,88 50,88 46,102 62,80 53,80 58,66" fill="#fde047"/>';
+  var FOG = '<g stroke="#94a3b8" stroke-width="4" stroke-linecap="round" opacity=".85">' +
+    '<line x1="30" y1="78" x2="70" y2="78"/><line x1="36" y1="86" x2="66" y2="86"/>' +
+    '<line x1="42" y1="94" x2="62" y2="94"/></g>';
+  var SMALLSUN = '<g><circle cx="36" cy="36" r="13" fill="#fbbf24"/>' +
+    '<g class="spin" stroke="#fbbf24" stroke-width="4" stroke-linecap="round">' +
+    '<line x1="36" y1="12" x2="36" y2="20"/><line x1="36" y1="52" x2="36" y2="60"/>' +
+    '<line x1="12" y1="36" x2="20" y2="36"/><line x1="52" y1="36" x2="60" y2="36"/></g></g>';
+
+  function icon(kind) {
+    var inner = '';
+    switch (kind) {
+      case 'sun':        inner = SUN; break;
+      case 'sun-cloud':  inner = SMALLSUN + CLOUD; break;
+      case 'cloud':      inner = CLOUD; break;
+      case 'fog':        inner = CLOUD + FOG; break;
+      case 'drizzle':
+      case 'rain':       inner = CLOUD + DROPS; break;
+      case 'snow':       inner = CLOUD + FLAKES; break;
+      case 'storm':      inner = CLOUD + BOLT; break;
+      default:           inner = CLOUD;
+    }
+    return '<svg viewBox="0 0 100 110" xmlns="http://www.w3.org/2000/svg">' +
+           inner + '</svg>';
+  }
+  function wmo(code) { return WMO[code] || ['—', 'cloud']; }
+
+  var wrap = document.getElementById('wrap');
+  var msg = document.getElementById('msg');
+  var staleEl = document.getElementById('stale');
+  var hasData = false;
+
+  function render(j) {
+    var m = j.meteo || {};
+    var cur = m.current || {}, daily = m.daily || {};
+    var info = wmo(cur.weather_code);
+    document.getElementById('city').textContent = CITY;
+    document.getElementById('icon').innerHTML = icon(info[1]);
+    document.getElementById('temp').textContent =
+      Math.round(cur.temperature_2m) + '°';
+    document.getElementById('desc').textContent = info[0];
+    document.getElementById('tmin').textContent =
+      Math.round((daily.temperature_2m_min || [])[0]);
+    document.getElementById('tmax').textContent =
+      Math.round((daily.temperature_2m_max || [])[0]);
+    document.getElementById('wind').textContent =
+      Math.round(cur.wind_speed_10m || 0);
+    var daysHtml = '';
+    for (var i = 1; i <= 3; i++) {
+      var t = (daily.time || [])[i];
+      if (!t) continue;
+      var dname = new Date(t + 'T12:00:00')
+        .toLocaleDateString('it-IT', { weekday: 'short' });
+      var di = wmo((daily.weather_code || [])[i]);
+      daysHtml += '<div class="day"><div class="d">' + dname + '</div>' +
+        icon(di[1]) +
+        '<div class="mm"><b>' +
+        Math.round((daily.temperature_2m_max || [])[i]) + '°</b>' +
+        ' <span class="lo">' +
+        Math.round((daily.temperature_2m_min || [])[i]) + '°</span></div></div>';
+    }
+    document.getElementById('days').innerHTML = daysHtml;
+    if (j.stale) {
+      var ts = j.fetched_at ? new Date(j.fetched_at * 1000) : null;
+      staleEl.textContent = 'Dati offline' +
+        (ts ? ' · agg. ' + ts.toLocaleTimeString('it-IT',
+              { hour: '2-digit', minute: '2-digit' }) : '');
+      staleEl.style.display = 'block';
+    } else {
+      staleEl.style.display = 'none';
+    }
+    msg.style.display = 'none';
+    wrap.style.display = 'block';
+    hasData = true;
+  }
+
+  function load() {
+    if (!LAT || !LON) {
+      msg.textContent = 'Coordinate mancanti: aggiungi ?lat=..&lon=..';
+      msg.style.display = 'block';
+      return;
+    }
+    fetch('/api/apps/weather_data?lat=' + encodeURIComponent(LAT) +
+          '&lon=' + encodeURIComponent(LON))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.ok && j.meteo) render(j);
+        else if (!hasData) msg.style.display = 'block';
+      })
+      .catch(function () {
+        if (!hasData) msg.style.display = 'block';
+        // con dati già mostrati: silenzioso, riprova al prossimo tick
+      });
+  }
+  load();
+  setInterval(load, 15 * 60 * 1000);  // refresh ogni 15 min
+})();
+</script>
+</body>
+</html>

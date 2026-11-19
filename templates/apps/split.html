@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Split-Screen</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  #grid {
+    display: grid; width: 100vw; height: 100vh; overflow: hidden;
+    grid-template-columns: {% if side_url %}3fr 1fr{% else %}1fr{% endif %};
+  }
+  #main { position: relative; overflow: hidden; background: #000; }
+  #main video, #main img, #main iframe {
+    width: 100%; height: 100%; border: 0; display: block;
+    object-fit: contain; background: #000;
+  }
+  #main iframe { object-fit: unset; }
+  #side { overflow: hidden; border-left: 2px solid rgba(255,255,255,.15); }
+  #side iframe { width: 100%; height: 100%; border: 0; display: block; }
+  #ph {
+    width: 100%; height: 100%; display: flex; align-items: center;
+    justify-content: center; color: #475569;
+    font: 500 2vw "Segoe UI", system-ui, sans-serif; text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="grid">
+  <div id="main">
+    {% if main_tipo == 'video' %}
+    <video src="{{ main_url }}" autoplay loop muted playsinline></video>
+    {% elif main_tipo == 'image' %}
+    <img src="{{ main_url }}" alt="">
+    {% elif main_url %}
+    <iframe src="{{ main_url }}" scrolling="no"
+            allow="autoplay; fullscreen; encrypted-media"></iframe>
+    {% else %}
+    <div id="ph">Nessun contenuto principale<br>aggiungi ?main=/media/file.mp4</div>
+    {% endif %}
+  </div>
+  {% if side_url %}
+  <div id="side"><iframe src="{{ side_url }}" scrolling="no"></iframe></div>
+  {% endif %}
+</div>
+</body>
+</html>

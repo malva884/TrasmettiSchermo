@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.git/
+.idea/
+.env
+venv/
+.venv/
+data/
+static/media/
+media/
+config.json
+test_smoke.py

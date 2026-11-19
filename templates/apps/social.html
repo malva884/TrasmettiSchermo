@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<!-- auto-reload: nuovi post/recensioni senza intervento manuale -->
+<meta http-equiv="refresh" content="900">
+<title>{{ nome }}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden;
+               background: #f1f5f9;
+               font-family: "Segoe UI", system-ui, sans-serif; }
+  #wrap { width: 100vw; height: 100vh; overflow: hidden; }
+  #empty {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; height: 100vh; text-align: center;
+    color: #64748b; gap: 2vh;
+  }
+  #empty .t { font-size: 3vw; font-weight: 700; color: #334155; }
+  #empty .s { font-size: 1.6vw; }
+</style>
+</head>
+<body>
+{% if html_snippet %}
+<div id="wrap">{{ html_snippet|safe }}</div>
+{% else %}
+<div id="empty">
+  <div class="t">{{ nome }}</div>
+  <div class="s">Widget non ancora configurato.<br>
+    Incolla il codice embed nella sezione App &amp; Widget del pannello admin.</div>
+</div>
+{% endif %}
+</body>
+</html>
