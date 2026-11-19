@@ -24,6 +24,8 @@ try:
     LOCAL_TZ = ZoneInfo(os.environ.get("TZ", "Europe/Rome"))
 except Exception:
     LOCAL_TZ = timezone.utc
+    print("WARN: tzdata non disponibile, palinsesto valutato in UTC. "
+          "Installare il pacchetto 'tzdata' o impostare TZ.")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -628,7 +630,10 @@ def scheduler_loop():
             sched_tick()
         except Exception:
             pass
-        socketio.sleep(30)
+        # dorme fino al secondo ~1 del minuto successivo: le fasce
+        # iniziano/finiscono entro ~1s dal cambio minuto
+        _n = datetime.now()
+        socketio.sleep(max(2.0, 61.0 - _n.second - _n.microsecond / 1e6))
 
 
 # ---------------------------------------------------------------- auth
