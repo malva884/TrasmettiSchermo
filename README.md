@@ -47,10 +47,11 @@ Dockerfile           immagine produzione (Gunicorn + gevent, 1 worker)
 - **Riconnessione automatica** con backoff esponenziale; al reconnect il client re-entra nella room e riceve il contenuto corrente
 - **Cache-busting** automatico (`?v=<ts>`) sui file in `/media/`
 - **Refresh notturno alle 04:00** lato client (anti memory-leak su Fire TV Stick) + pulsante **Force reload** remoto
-- **Fallback X-Frame-Options**: modalità `redirect` selezionabile in admin per siti che bloccano gli iframe; timeout-euristica di 12s sull'iframe
+- **Fallback X-Frame-Options**: modalità `redirect` selezionabile in admin per siti che bloccano gli iframe; timeout-euristica di 12s sull'iframe. La modalità `proxy` inoltra anche le richieste `POST` (body/cookie) e inietta nelle pagine HTML un interceptor che reindirizza `fetch`/`XMLHttpRequest` interne verso `/proxy` — le bacheche interattive funzionano senza blocchi CORS mantenendo il controllo WebSocket
 - **Playlist temporizzate** `[{url, durata_sec}]` gestite lato server (sincronizzate su tutti i client del gruppo), riavviate automaticamente dopo un reboot del server. Per le slide YouTube il player usa la IFrame Player API e segnala l'evento `ENDED`: la slide avanza al termine esatto del filmato (`durata_sec` resta il tempo massimo; `durata_sec: 0` = attendi solo la fine del video, cap 24h)
 - **Contatore client connessi** per gruppo, in tempo reale nel pannello admin
 - **Targeting**: singolo gruppo, sottoinsieme (checkbox) o broadcast "Tutti"
+- **Guida setup dispositivi** in `/admin` (pulsante in topbar): URL player dinamico + QR code, istruzioni kiosk per Fire TV Stick, Android/Google TV, Samsung/LG, Mini-PC Windows, Raspberry/Linux e tablet
 
 ## App & Widget
 

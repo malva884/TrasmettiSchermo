@@ -14,6 +14,7 @@ import requests as ext_requests
 from flask import (Flask, Response, abort, jsonify, make_response,
                    render_template, request, send_from_directory)
 from flask_socketio import SocketIO, join_room, leave_room
+from urllib.parse import urlparse
 from werkzeug.utils import secure_filename
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -520,32 +521,86 @@ SKIP_HEADERS = {"x-frame-options", "content-security-policy",
                 "content-length", "content-encoding", "transfer-encoding",
                 "connection", "content-type"}
 
+# Iniettato dopo <head> nelle pagine HTML proxate: le chiamate interne
+# fetch()/XMLHttpRequest verso l'origine target ripassano da /proxy
+# (stessa origine del player) -> niente blocchi CORS del browser.
+PROXY_INTERCEPT = """<script>
+(function () {
+  var ORIGIN = %s;
+  var PROX = "/proxy?u=";
+  function prox(u) {
+    if (typeof u !== "string" || !u) return u;
+    var abs;
+    try { abs = new URL(u, document.baseURI).href; }
+    catch (e) { return u; }
+    return abs.indexOf(ORIGIN) === 0 ? PROX + encodeURIComponent(abs) : u;
+  }
+  var of = window.fetch;
+  window.fetch = function (input, init) {
+    if (typeof input === "string") { input = prox(input); }
+    else if (input instanceof Request) {
+      input = new Request(prox(input.url), input);
+    }
+    return of.call(this, input, init);
+  };
+  var oo = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    var rest = Array.prototype.slice.call(arguments, 2);
+    return oo.apply(this, [method, prox(url)].concat(rest));
+  };
+})();
+</script>"""
 
-@app.route("/proxy")
+
+def _same_origin(a, b):
+    pa, pb = urlparse(a), urlparse(b)
+    return pa.scheme == pb.scheme and pa.netloc.lower() == pb.netloc.lower()
+
+
+@app.route("/proxy", methods=["GET", "POST"])
 def proxy_page():
     """Proxy lato server per URL esterni che bloccano gli iframe.
     Serve la pagina senza X-Frame-Options/CSP così il player può caricarla
-    in iframe mantenendo il controllo WebSocket (reload, cambio contenuto)."""
+    in iframe mantenendo il controllo WebSocket (reload, cambio contenuto).
+    Accetta GET e POST (inoltrando body e cookie) perché le app interattive
+    proxate riusano questa rotta per le loro chiamate interne; la whitelist
+    copre l'URL configurato e ogni URL della sua stessa origine."""
     u = (request.args.get("u") or "").strip()
     if not u.lower().startswith(("http://", "https://")):
         abort(400)
-    if u not in allowed_proxy_urls():
+    allowed = allowed_proxy_urls()
+    if u not in allowed and not any(_same_origin(u, a) for a in allowed):
         abort(403)
     try:
-        r = ext_requests.get(u, timeout=20, stream=True,
-                             headers={"User-Agent": PROXY_UA},
-                             allow_redirects=True)
+        headers = {"User-Agent": PROXY_UA}
+        # cookie e content-type inoltrati: login/session e POST delle
+        # bacheche interattive proxate continuano a funzionare
+        if request.headers.get("Cookie"):
+            headers["Cookie"] = request.headers["Cookie"]
+        if request.method == "POST":
+            ct = request.headers.get("Content-Type")
+            if ct:
+                headers["Content-Type"] = ct
+            r = ext_requests.post(u, data=request.get_data() or None,
+                                  timeout=20, stream=True, headers=headers,
+                                  allow_redirects=True)
+        else:
+            r = ext_requests.get(u, timeout=20, stream=True,
+                                 headers=headers, allow_redirects=True)
     except ext_requests.RequestException:
         abort(502)
     ctype = r.headers.get("Content-Type", "")
     if "text/html" in ctype.lower():
         html = r.text
         r.close()
+        p = urlparse(r.url)
+        origin = f"{p.scheme}://{p.netloc}"
         # <base> per risolvere risorse/link relativi verso l'origine
-        base_tag = f'<base href="{r.url}">'
+        inject = (f'<base href="{r.url}">' +
+                  PROXY_INTERCEPT % json.dumps(origin))
         m = re.search(r"<head[^>]*>", html, re.I)
-        html = (html[:m.end()] + base_tag + html[m.end():]
-                if m else base_tag + html)
+        html = (html[:m.end()] + inject + html[m.end():]
+                if m else inject + html)
         resp = Response(html, status=r.status_code, content_type=ctype)
     else:
         resp = Response(r.iter_content(64 * 1024), status=r.status_code,

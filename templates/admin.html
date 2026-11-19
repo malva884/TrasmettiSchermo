@@ -7,6 +7,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
 /* Alpine component definito prima del caricamento di Alpine (defer) */
 function admin() {
@@ -16,6 +17,15 @@ function admin() {
     connected: false,
     stato: { gruppi: {}, clients: {}, media: [] },
     assign: { open: false, target: 'all', url: '', mode: 'auto' },
+    guide: { open: false, tab: 'firetv' },
+    guideTabs: [
+      { id: 'firetv',    label: 'Fire TV Stick' },
+      { id: 'androidtv', label: 'Android / Google TV' },
+      { id: 'samlg',     label: 'Samsung / LG' },
+      { id: 'windows',   label: 'Mini-PC Windows' },
+      { id: 'raspberry', label: 'Raspberry / Linux' },
+      { id: 'tablet',    label: 'Tablet / iPad' }
+    ],
     tx: null,          // chiave asset con menu "Trasmetti" aperto
     menu: null,        // gruppo con menu contestuale aperto
     plGroup: '', plItems: [], dragIdx: null, urlInput: '',
@@ -458,6 +468,20 @@ function admin() {
         navigator.clipboard.writeText(u).then(done).catch(() => this.showToast(u));
       } else { this.showToast(u); }
     },
+    tvUrl() {
+      return location.origin + '/tv';
+    },
+    openGuide() {
+      this.guide.open = true; this.icons();
+      this.$nextTick(() => this.renderQr());
+    },
+    renderQr() {
+      const el = document.getElementById('guide-qr');
+      if (!el || typeof QRCode === 'undefined') return;
+      el.innerHTML = '';
+      new QRCode(el, { text: this.tvUrl(), width: 112, height: 112,
+                       correctLevel: QRCode.CorrectLevel.M });
+    },
     pvSrc(u) {
       // preview admin: URL interni (/apps, /media) diretti, esterni via proxy
       return (u || '').startsWith('/') ? u
@@ -558,6 +582,11 @@ function admin() {
               :class="connected ? 'bg-emerald-400' : 'bg-red-400 animate-pulse'"></span>
         <span x-text="connected ? 'Server online' : 'Offline'"></span>
       </div>
+      <button @click="openGuide()"
+        class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium
+               px-3 py-1.5 rounded-lg transition flex items-center gap-1.5">
+        <i data-lucide="circle-help" class="w-4 h-4"></i> Guida Dispositivi
+      </button>
       <button @click="primaryAction()"
         class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium
                px-4 py-1.5 rounded-lg transition flex items-center gap-1.5">
@@ -1184,6 +1213,154 @@ function admin() {
         class="px-4 py-2 text-sm rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white
                font-medium transition flex items-center gap-1.5">
         <i data-lucide="send" class="w-3.5 h-3.5"></i> Metti in onda</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== MODALE GUIDA DISPOSITIVI ==================== -->
+<div x-cloak x-show="guide.open" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+  <div class="absolute inset-0 bg-black/70" @click="guide.open=false"></div>
+  <div class="relative w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-5
+              max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold flex items-center gap-2">
+        <i data-lucide="monitor-smartphone" class="w-5 h-5 text-indigo-400"></i>
+        Guida setup dispositivi
+      </h3>
+      <button @click="guide.open=false"
+        class="text-slate-500 hover:text-white transition">
+        <i data-lucide="x" class="w-5 h-5"></i></button>
+    </div>
+
+    <!-- URL player + QR -->
+    <div class="flex items-center gap-4 bg-slate-800/60 border border-slate-700
+                rounded-xl p-3 mb-4">
+      <div id="guide-qr" class="shrink-0 bg-white p-1.5 rounded-lg"></div>
+      <div class="min-w-0 flex-1">
+        <div class="text-xs text-slate-400 mb-1">URL Player</div>
+        <code x-text="tvUrl()" class="block text-sm text-indigo-300 break-all mb-2"></code>
+        <button @click="copyText(tvUrl())"
+          class="bg-slate-700 hover:bg-slate-600 text-xs font-medium px-3 py-1.5
+                 rounded-lg transition flex items-center gap-1.5">
+          <i data-lucide="copy" class="w-3.5 h-3.5"></i> Copia link
+        </button>
+        <p class="text-[11px] text-slate-500 mt-2">
+          Aggiungi <code class="text-slate-400">/&lt;gruppo&gt;</code> per aprire direttamente
+          un gruppo (es. <code x-text="tvUrl() + '/sala'" class="text-slate-400"></code>).
+          Il QR è scansionabile da smartphone/tablet per test rapidi.
+        </p>
+      </div>
+    </div>
+
+    <!-- tab dispositivi -->
+    <div class="flex flex-wrap gap-1.5 mb-4">
+      <template x-for="t in guideTabs" :key="t.id">
+        <button @click="guide.tab = t.id"
+          :class="guide.tab === t.id
+                  ? 'bg-indigo-600 text-white border-indigo-500'
+                  : 'bg-slate-800 text-slate-400 border-slate-700 hover:border-slate-500'"
+          class="border rounded-lg px-3 py-1.5 text-xs font-medium transition"
+          x-text="t.label"></button>
+      </template>
+    </div>
+
+    <div class="text-sm text-slate-300">
+
+      <!-- Fire TV Stick -->
+      <ol x-show="guide.tab==='firetv'" class="list-decimal pl-5 space-y-2">
+        <li>Abilita le <b>Opzioni sviluppatore</b>: Impostazioni → La mia Fire TV →
+            Informazioni → premi <b>7 volte</b> sul nome del dispositivo.</li>
+        <li>Installa l'app <b>Downloader</b> dall'Amazon Appstore e abilitala in
+            Opzioni sviluppatore → <b>Installa app sconosciute</b>.</li>
+        <li>Da Downloader scarica e installa l'APK ufficiale di
+            <b>Fully Kiosk Browser</b> per Fire OS (fully-kiosk.com).</li>
+        <li>In Fully Kiosk: imposta <b>Start URL</b> su
+            <code x-text="tvUrl()" class="text-indigo-300"></code>, attiva
+            <b>Launch on Boot</b>, <b>Keep Screen On</b> e <b>Kiosk Mode</b> (con PIN).</li>
+        <li>Disattiva il salvaschermo di sistema: Impostazioni → Display e suoni →
+            Salvaschermo → <b>Mai</b>.</li>
+      </ol>
+
+      <!-- Android / Google TV -->
+      <ol x-show="guide.tab==='androidtv'" class="list-decimal pl-5 space-y-2">
+        <li>Installa <b>Fully Kiosk Browser</b> o <b>TV Bro</b> dal Play Store.</li>
+        <li>Apri <code x-text="tvUrl()" class="text-indigo-300"></code>
+            a schermo intero.</li>
+        <li>Disattiva standby/salvaschermo e attiva l'avvio automatico
+            all'accensione (Launch on Boot in Fully Kiosk).</li>
+      </ol>
+
+      <!-- Samsung / LG -->
+      <ol x-show="guide.tab==='samlg'" class="list-decimal pl-5 space-y-2">
+        <li>Apri il browser integrato su
+            <code x-text="tvUrl()" class="text-indigo-300"></code>.</li>
+        <li>Impostalo come pagina iniziale / preferito.</li>
+        <li>Disattiva spegnimento automatico e salvaschermo nelle
+            impostazioni del TV.</li>
+      </ol>
+
+      <!-- Windows -->
+      <div x-show="guide.tab==='windows'" class="space-y-2">
+        <p>Crea un collegamento in <code class="text-slate-400">shell:startup</code>
+           (Win+R → shell:startup) con comando:</p>
+        <div class="flex items-center gap-2 bg-slate-800 border border-slate-700
+                    rounded-lg px-2.5 py-1.5">
+          <code class="text-xs text-emerald-300 flex-1 break-all"
+            >chrome.exe --kiosk --noerrdialogs --disable-infobars <span x-text="tvUrl()"></span></code>
+          <button @click="copyText('chrome.exe --kiosk --noerrdialogs --disable-infobars ' + tvUrl())"
+            class="bg-slate-700 hover:bg-slate-600 text-[11px] font-medium px-2 py-1
+                   rounded transition flex items-center gap-1 shrink-0">
+            <i data-lucide="copy" class="w-3 h-3"></i> Copia
+          </button>
+        </div>
+        <p>Opzioni risparmio energia → sospensione schermo/PC: <b>Mai</b>.</p>
+      </div>
+
+      <!-- Raspberry / Linux -->
+      <div x-show="guide.tab==='raspberry'" class="space-y-2">
+        <p>Autostart grafico
+           (<code class="text-slate-400">~/.config/autostart/signage.desktop</code>) con:</p>
+        <div class="flex items-center gap-2 bg-slate-800 border border-slate-700
+                    rounded-lg px-2.5 py-1.5">
+          <code class="text-xs text-emerald-300 flex-1 break-all"
+            >chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required <span x-text="tvUrl()"></span></code>
+          <button @click="copyText('chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required ' + tvUrl())"
+            class="bg-slate-700 hover:bg-slate-600 text-[11px] font-medium px-2 py-1
+                   rounded transition flex items-center gap-1 shrink-0">
+            <i data-lucide="copy" class="w-3 h-3"></i> Copia
+          </button>
+        </div>
+        <div class="flex items-center gap-2 bg-slate-800 border border-slate-700
+                    rounded-lg px-2.5 py-1.5">
+          <code class="text-xs text-emerald-300 flex-1"
+            >xset s off -dpms <span class="text-slate-500"># DPMS/screensaver off</span></code>
+          <button @click="copyText('xset s off -dpms')"
+            class="bg-slate-700 hover:bg-slate-600 text-[11px] font-medium px-2 py-1
+                   rounded transition flex items-center gap-1 shrink-0">
+            <i data-lucide="copy" class="w-3 h-3"></i> Copia
+          </button>
+        </div>
+      </div>
+
+      <!-- Tablet / iPad -->
+      <ul x-show="guide.tab==='tablet'" class="list-disc pl-5 space-y-2">
+        <li><b>Android</b>: Fully Kiosk Browser con Kiosk Mode e Keep Screen On su
+            <code x-text="tvUrl()" class="text-indigo-300"></code>.</li>
+        <li><b>iPadOS</b>: Safari su
+            <code x-text="tvUrl()" class="text-indigo-300"></code>
+            bloccato tramite Impostazioni → Accessibilità → <b>Accesso Guidato</b>.</li>
+      </ul>
+    </div>
+
+    <!-- abbinamento -->
+    <div class="mt-4 bg-indigo-600/10 border border-indigo-500/30 rounded-xl p-3
+                text-xs text-indigo-200 flex items-start gap-2">
+      <i data-lucide="link-2" class="w-4 h-4 shrink-0 mt-0.5"></i>
+      <div>
+        <b>Procedura di abbinamento:</b> il dispositivo mostra all'avvio un codice
+        univoco <code class="text-indigo-300">TV-XXXX</code>. Annotalo e assegnalo
+        al gruppo desiderato dalla scheda <b>Schermi</b> di questo pannello.
+      </div>
     </div>
   </div>
 </div>
