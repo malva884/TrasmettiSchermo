@@ -14,7 +14,7 @@ import requests as ext_requests
 from flask import (Flask, Response, abort, jsonify, make_response,
                    render_template, request, send_from_directory)
 from flask_socketio import SocketIO, join_room, leave_room
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from werkzeug.utils import secure_filename
 
 try:
@@ -713,7 +713,9 @@ SKIP_HEADERS = {"x-frame-options", "content-security-policy",
 PROXY_INTERCEPT = """<script>
 (function () {
   var ORIGIN = %s;
-  var PROX = "/proxy?u=";
+  // assoluto sull'origine del server signage: con il <base> remoto un
+  // path relativo "/proxy?u=" verrebbe risolto verso l'origine target
+  var PROX = location.origin + "/proxy?u=";
   function prox(u) {
     if (typeof u !== "string" || !u) return u;
     var abs;
@@ -734,6 +736,44 @@ PROXY_INTERCEPT = """<script>
     var rest = Array.prototype.slice.call(arguments, 2);
     return oo.apply(this, [method, prox(url)].concat(rest));
   };
+  // risorse same-origin iniettate via JS (innerHTML, setAttribute,
+  // img.src = ...): il rewrite statico lato server copre solo l'HTML
+  // iniziale. Le richieste ripassano da /proxy locale.
+  var ATTRS = ["src", "data-src", "poster"];
+  function fixEl(el) {
+    if (!el || !el.getAttribute) return;
+    for (var i = 0; i < ATTRS.length; i++) {
+      var a = ATTRS[i];
+      var v = el.getAttribute(a);
+      if (v && v.indexOf(PROX) !== 0) {
+        var nv = prox(v);
+        if (nv !== v) el.setAttribute(a, nv);
+      }
+    }
+  }
+  function fixTree(root) {
+    if (!root) return;
+    fixEl(root);
+    if (root.querySelectorAll) {
+      var nodes = root.querySelectorAll(
+        "img, source, video, track, audio");
+      for (var i = 0; i < nodes.length; i++) fixEl(nodes[i]);
+    }
+  }
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) {
+      if (m.type === "attributes") fixEl(m.target);
+      if (m.addedNodes) {
+        m.addedNodes.forEach(function (n) {
+          if (n.nodeType === 1) fixTree(n);
+        });
+      }
+    });
+  }).observe(document.documentElement || document,
+             { childList: true, subtree: true, attributes: true,
+               attributeFilter: ATTRS });
+  document.addEventListener("DOMContentLoaded",
+                            function () { fixTree(document); });
 })();
 </script>"""
 
@@ -781,6 +821,23 @@ def proxy_page():
         r.close()
         p = urlparse(r.url)
         origin = f"{p.scheme}://{p.netloc}"
+        # risorse same-origin (immagini, media, form) via /proxy: l'host
+        # remoto puo' rifiutare le richieste dirette del browser (WAF,
+        # referer); il fetch server-side usa PROXY_UA e il player riceve
+        # la risorsa same-origin. Il path e' assoluto perche' il <base>
+        # remoto risolverebbe un relativo verso l'origine target.
+        _self = request.host_url.rstrip("/")
+
+        def _rw_url(m):
+            pre, q, url = m.groups()
+            if _same_origin(url, r.url):
+                return (f"{pre}{q}{_self}/proxy?u="
+                        f"{quote(url, safe='')}{q}")
+            return m.group(0)
+
+        html = re.sub(
+            r'(\s(?:src|poster|data-src|action)\s*=\s*)(["\'])'
+            r'(https?://[^"\']+)\2', _rw_url, html, flags=re.I)
         # <base> per risolvere risorse/link relativi verso l'origine
         inject = (f'<base href="{r.url}">' +
                   PROXY_INTERCEPT % json.dumps(origin))
