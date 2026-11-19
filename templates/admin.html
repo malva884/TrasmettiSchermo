@@ -26,6 +26,9 @@ function admin() {
       { id: 'raspberry', label: 'Raspberry / Linux' },
       { id: 'tablet',    label: 'Tablet / iPad' }
     ],
+    sched: { id: '', name: '', target: 'all', src: 'app', app_id: '',
+             media: '', url: '', mode: 'iframe', days: [1, 2, 3, 4, 5],
+             start: '08:00', end: '18:00', enabled: true },
     tx: null,          // chiave asset con menu "Trasmetti" aperto
     menu: null,        // gruppo con menu contestuale aperto
     plGroup: '', plItems: [], dragIdx: null, urlInput: '',
@@ -482,6 +485,110 @@ function admin() {
       new QRCode(el, { text: this.tvUrl(), width: 112, height: 112,
                        correctLevel: QRCode.CorrectLevel.M });
     },
+
+    /* ---------------- palinsesto ---------------- */
+    schedules() {
+      const q = this.search.toLowerCase();
+      return (this.stato.schedules || [])
+        .filter(s => !q || (s.name || '').toLowerCase().includes(q));
+    },
+    schedReset() {
+      this.sched = { id: '', name: '', target: 'all', src: 'app', app_id: '',
+                     media: '', url: '', mode: 'iframe',
+                     days: [1, 2, 3, 4, 5], start: '08:00', end: '18:00',
+                     enabled: true };
+    },
+    schedDayToggle(d) {
+      const i = this.sched.days.indexOf(d);
+      if (i < 0) { this.sched.days.push(d); this.sched.days.sort(); }
+      else this.sched.days.splice(i, 1);
+    },
+    schedTargetName(t) {
+      if (t === 'all') return 'Tutti i gruppi';
+      if (t && t.startsWith('group:')) return 'Gruppo: ' + t.slice(6);
+      if (t && t.startsWith('device:')) {
+        const d = (this.stato.dispositivi || {})[t.slice(7)] || {};
+        return 'Schermo: ' + (d.nome || t.slice(7));
+      }
+      return t || '';
+    },
+    schedDaysLabel(days) {
+      const L = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom'];
+      return (days || []).map(d => L[d - 1] || d).join(', ');
+    },
+    schedEdit(s) {
+      const url = s.content_url || '';
+      const src = url.startsWith('/apps/') ? 'app'
+                : url.startsWith('/media/') ? 'media' : 'url';
+      const appId = src === 'app'
+        ? Object.keys(this.stato.app_configs || {})
+            .find(k => (this.stato.app_configs[k].url || '') === url
+                       || '/apps/social/' + k === url) || '' : '';
+      this.sched = { id: s.id, name: s.name || '', target: s.target || 'all',
+                     src: src, app_id: appId,
+                     media: src === 'media' ? url : '',
+                     url: src === 'url' ? url : '',
+                     mode: s.mode || 'iframe',
+                     days: (s.days || []).slice(),
+                     start: s.start_time || '08:00',
+                     end: s.end_time || '18:00',
+                     enabled: s.enabled !== false };
+    },
+    schedUrl() {
+      if (this.sched.src === 'app') {
+        const a = (this.stato.app_configs || {})[this.sched.app_id] || {};
+        return a.url || (a.tipo === 'social'
+                         ? '/apps/social/' + this.sched.app_id : '');
+      }
+      if (this.sched.src === 'media') return this.sched.media;
+      return (this.sched.url || '').trim();
+    },
+    schedSave() {
+      const body = { id: this.sched.id || undefined, name: this.sched.name,
+                     target: this.sched.target,
+                     content_url: this.schedUrl(),
+                     mode: this.sched.src === 'url' ? this.sched.mode
+                                                    : 'iframe',
+                     days: this.sched.days, start_time: this.sched.start,
+                     end_time: this.sched.end, enabled: this.sched.enabled };
+      this.api('/api/schedules', body).then(j => {
+        this.showToast(j.ok ? 'Fascia salvata' : (j.error || 'Errore'), !j.ok);
+        if (j.ok) { this.schedReset(); this.icons(); }
+      });
+    },
+    schedToggle(s) {
+      this.api('/api/schedules', { id: s.id, enabled: !s.enabled })
+        .then(j => { this.showToast(j.ok ? (s.enabled ? 'Fascia disattivata'
+                                           : 'Fascia attivata')
+                                  : (j.error || 'Errore'), !j.ok);
+                     this.icons(); });
+    },
+    schedDel(s) {
+      if (!confirm('Eliminare la fascia "' + (s.name || s.id) + '"?')) return;
+      this.api('/api/schedules/' + encodeURIComponent(s.id), null, 'DELETE')
+        .then(j => this.showToast(j.ok ? 'Fascia eliminata'
+                                       : (j.error || 'Errore'), !j.ok));
+    },
+    schedResume() {
+      this.api('/api/schedules/resume', {})
+        .then(j => this.showToast(j.ok ? 'Palinsesto ripreso'
+                                       : (j.error || 'Errore'), !j.ok));
+    },
+    setDefault(g) {
+      this.api('/api/gruppo/' + encodeURIComponent(g) + '/default',
+               { use_current: true })
+        .then(j => this.showToast(j.ok ? 'Contenuto predefinito impostato '
+                                       + '(fallback del palinsesto)'
+                                       : (j.error || 'Errore'), !j.ok));
+      this.menu = null;
+    },
+    clearDefault(g) {
+      this.api('/api/gruppo/' + encodeURIComponent(g) + '/default',
+               { url: null })
+        .then(j => this.showToast(j.ok ? 'Predefinito rimosso'
+                                       : (j.error || 'Errore'), !j.ok));
+      this.menu = null;
+    },
     pvSrc(u) {
       // preview admin: URL interni (/apps, /media) diretti, esterni via proxy
       return (u || '').startsWith('/') ? u
@@ -493,13 +600,15 @@ function admin() {
       return this.view === 'screens' ? '+ Trasmetti'
            : this.view === 'groups' ? '+ Nuovo gruppo'
            : this.view === 'assets' ? '+ Carica media'
-           : this.view === 'apps' ? '+ Nuovo widget social' : '+ Slide';
+           : this.view === 'apps' ? '+ Nuovo widget social'
+           : this.view === 'schedule' ? '+ Fascia oraria' : '+ Slide';
     },
     primaryAction() {
       if (this.view === 'screens') this.openAssign('all');
       else if (this.view === 'groups') this.nuovoGruppo();
       else if (this.view === 'assets') this.$refs.fileInput.click();
       else if (this.view === 'apps') this.openAppModal('social');
+      else if (this.view === 'schedule') this.schedReset();
       else { this.plItems.push({ url: '', durata_sec: 15 }); this.icons(); }
     },
     closeAll() { this.assign.open = false; this.appModal.open = false;
@@ -557,6 +666,11 @@ function admin() {
         :class="view==='playlist' ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800'"
         class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition">
         <i data-lucide="list-video" class="w-4 h-4"></i> Playlist
+      </button>
+      <button @click="setView('schedule')"
+        :class="view==='schedule' ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800'"
+        class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition">
+        <i data-lucide="calendar-clock" class="w-4 h-4"></i> Palinsesto
       </button>
     </nav>
     <div class="mt-auto p-4 text-[11px] text-slate-600 border-t border-slate-800">
@@ -810,6 +924,12 @@ function admin() {
                       <button @click="copyLink(g[0])"
                         class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
                         <i data-lucide="link" class="w-3.5 h-3.5"></i> Copia link player</button>
+                      <button @click="setDefault(g[0])"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
+                        <i data-lucide="star" class="w-3.5 h-3.5"></i> Predefinito = contenuto attuale</button>
+                      <button x-show="g[1].default_content" @click="clearDefault(g[0])"
+                        class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
+                        <i data-lucide="star-off" class="w-3.5 h-3.5"></i> Rimuovi predefinito</button>
                       <button @click="goPlaylist(g[0])"
                         class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">
                         <i data-lucide="list-video" class="w-3.5 h-3.5"></i> Modifica playlist</button>
@@ -1126,6 +1246,217 @@ function admin() {
               </div>
             </div>
           </div>
+        </div>
+      </section>
+
+      <!-- ==================== VISTA PALINSESTO ==================== -->
+      <section x-show="view==='schedule'" x-cloak>
+        <!-- banner override manuale -->
+        <div x-show="(stato.sched_manual || []).length"
+             class="mb-4 bg-amber-500/10 border border-amber-500/40 rounded-xl p-3
+                    flex items-center gap-3 text-xs text-amber-200">
+          <i data-lucide="hand" class="w-4 h-4 shrink-0"></i>
+          <span class="flex-1">
+            <b x-text="(stato.sched_manual || []).length"></b> target con
+            contenuto messo in onda manualmente: il palinsesto è in pausa su
+            questi fino al prossimo cambio fascia.
+          </span>
+          <button @click="schedResume()"
+            class="bg-amber-600 hover:bg-amber-500 text-white font-medium
+                   px-3 py-1.5 rounded-lg transition flex items-center gap-1.5 shrink-0">
+            <i data-lucide="play" class="w-3.5 h-3.5"></i> Riprendi palinsesto
+          </button>
+        </div>
+
+        <!-- form fascia oraria -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-5">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3"
+              x-text="sched.id ? 'Modifica fascia oraria' : 'Nuova fascia oraria'"></h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] text-slate-500 mb-1">Nome</label>
+              <input x-model="sched.name" type="text" placeholder="Es. TG pausa pranzo"
+                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                       text-sm focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-500 mb-1">Destinatario</label>
+              <select x-model="sched.target"
+                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                       text-sm focus:outline-none focus:border-indigo-500">
+                <option value="all">Tutti i gruppi (broadcast)</option>
+                <optgroup label="Gruppi">
+                  <template x-for="gn in groupNames" :key="'scg-'+gn">
+                    <option :value="'group:' + gn" x-text="gn"></option>
+                  </template>
+                </optgroup>
+                <optgroup label="Schermi singoli">
+                  <template x-for="d in devices()" :key="'scd-'+d.id">
+                    <option :value="'device:' + d.id"
+                            x-text="(d.nome || d.id) + ' (' + d.id + ')'"></option>
+                  </template>
+                </optgroup>
+              </select>
+            </div>
+            <div class="md:col-span-2 flex flex-wrap items-end gap-3">
+              <div class="w-40">
+                <label class="block text-[11px] text-slate-500 mb-1">Sorgente</label>
+                <select x-model="sched.src"
+                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                         text-sm focus:outline-none focus:border-indigo-500">
+                  <option value="app">App salvata</option>
+                  <option value="media">Libreria media</option>
+                  <option value="url">URL personalizzato</option>
+                </select>
+              </div>
+              <div class="flex-1 min-w-[200px]">
+                <template x-if="sched.src==='app'">
+                  <div>
+                    <label class="block text-[11px] text-slate-500 mb-1">App</label>
+                    <select x-model="sched.app_id"
+                      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                             text-sm focus:outline-none focus:border-indigo-500">
+                      <option value="">— scegli app —</option>
+                      <template x-for="a in apps()" :key="'sca-'+a.id">
+                        <option :value="a.id" x-text="a.nome"></option>
+                      </template>
+                    </select>
+                  </div>
+                </template>
+                <template x-if="sched.src==='media'">
+                  <div>
+                    <label class="block text-[11px] text-slate-500 mb-1">File</label>
+                    <select x-model="sched.media"
+                      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                             text-sm focus:outline-none focus:border-indigo-500">
+                      <option value="">— scegli file —</option>
+                      <template x-for="f in stato.media" :key="'scm-'+f">
+                        <option :value="'/media/'+f" x-text="f"></option>
+                      </template>
+                    </select>
+                  </div>
+                </template>
+                <template x-if="sched.src==='url'">
+                  <div>
+                    <label class="block text-[11px] text-slate-500 mb-1">URL</label>
+                    <input x-model="sched.url" type="text"
+                           placeholder="https://… oppure /apps/clock"
+                      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                             text-sm focus:outline-none focus:border-indigo-500">
+                  </div>
+                </template>
+              </div>
+              <div class="w-32" x-show="sched.src==='url'">
+                <label class="block text-[11px] text-slate-500 mb-1">Modalità</label>
+                <select x-model="sched.mode"
+                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                         text-sm focus:outline-none focus:border-indigo-500">
+                  <option value="auto">Auto</option>
+                  <option value="iframe">Iframe</option>
+                  <option value="proxy">Proxy</option>
+                  <option value="redirect">Redirect</option>
+                </select>
+              </div>
+            </div>
+            <div class="md:col-span-2">
+              <label class="block text-[11px] text-slate-500 mb-1">Giorni</label>
+              <div class="flex flex-wrap gap-1.5">
+                <template x-for="(lbl, i) in ['Lun','Mar','Mer','Gio','Ven','Sab','Dom']" :key="i">
+                  <button type="button" @click="schedDayToggle(i+1)"
+                    :class="sched.days.includes(i+1)
+                            ? 'bg-indigo-600 border-indigo-500 text-white'
+                            : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'"
+                    class="border rounded-lg px-3 py-1.5 text-xs font-medium transition"
+                    x-text="lbl"></button>
+                </template>
+              </div>
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-500 mb-1">Ora inizio</label>
+              <input x-model="sched.start" type="time"
+                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                       text-sm focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-500 mb-1">Ora fine</label>
+              <input x-model="sched.end" type="time"
+                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
+                       text-sm focus:outline-none focus:border-indigo-500">
+            </div>
+            <div class="flex items-center gap-2 md:col-span-2">
+              <input x-model="sched.enabled" type="checkbox" id="sched-en"
+                     class="accent-indigo-500 w-4 h-4">
+              <label for="sched-en" class="text-sm">Fascia attiva</label>
+            </div>
+          </div>
+          <div class="flex justify-end gap-2 mt-4">
+            <button x-show="sched.id" @click="schedReset()"
+              class="px-4 py-2 text-sm rounded-lg bg-slate-800 hover:bg-slate-700 transition">
+              Annulla modifica</button>
+            <button @click="schedSave()"
+              class="px-4 py-2 text-sm rounded-lg bg-indigo-600 hover:bg-indigo-500
+                     text-white font-medium transition flex items-center gap-1.5">
+              <i data-lucide="calendar-check" class="w-4 h-4"></i>
+              <span x-text="sched.id ? 'Salva modifiche' : 'Crea fascia'"></span>
+            </button>
+          </div>
+        </div>
+
+        <!-- tabella programmazioni -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+          <div x-show="!schedules().length"
+               class="text-slate-500 text-sm py-10 text-center">
+            Nessuna fascia programmata.
+          </div>
+          <table x-show="schedules().length" class="w-full text-sm">
+            <thead>
+              <tr class="text-left text-[11px] uppercase tracking-wider text-slate-500
+                         border-b border-slate-800">
+                <th class="px-4 py-2.5 font-medium">Fascia</th>
+                <th class="px-4 py-2.5 font-medium">Destinatario</th>
+                <th class="px-4 py-2.5 font-medium">Contenuto</th>
+                <th class="px-4 py-2.5 font-medium">Giorni</th>
+                <th class="px-4 py-2.5 font-medium">Orario</th>
+                <th class="px-4 py-2.5 font-medium text-right">Azioni</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="s in schedules()" :key="s.id">
+                <tr class="border-b border-slate-800/60 last:border-0"
+                    :class="s.enabled ? '' : 'opacity-50'">
+                  <td class="px-4 py-2.5 font-medium" x-text="s.name"></td>
+                  <td class="px-4 py-2.5 text-slate-400"
+                      x-text="schedTargetName(s.target)"></td>
+                  <td class="px-4 py-2.5 text-slate-500 font-mono text-xs max-w-[220px]
+                             truncate" :title="s.content_url"
+                      x-text="s.content_url"></td>
+                  <td class="px-4 py-2.5 text-slate-400"
+                      x-text="schedDaysLabel(s.days)"></td>
+                  <td class="px-4 py-2.5 text-slate-400 whitespace-nowrap">
+                    <span x-text="s.start_time"></span>–<span x-text="s.end_time"></span>
+                  </td>
+                  <td class="px-4 py-2.5">
+                    <div class="flex items-center justify-end gap-1">
+                      <button @click="schedToggle(s)"
+                        :title="s.enabled ? 'Disattiva' : 'Attiva'"
+                        class="px-2 py-1 rounded transition"
+                        :class="s.enabled ? 'text-emerald-400 hover:bg-slate-800'
+                                          : 'text-slate-500 hover:bg-slate-800'">
+                        <i :data-lucide="s.enabled ? 'toggle-right' : 'toggle-left'"
+                           class="w-4 h-4"></i></button>
+                      <button @click="schedEdit(s)" title="Modifica"
+                        class="px-2 py-1 rounded text-slate-400 hover:bg-slate-800 transition">
+                        <i data-lucide="pencil" class="w-4 h-4"></i></button>
+                      <button @click="schedDel(s)" title="Elimina"
+                        class="px-2 py-1 rounded text-slate-400 hover:bg-slate-800
+                               hover:text-red-400 transition">
+                        <i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
         </div>
       </section>
     </main>

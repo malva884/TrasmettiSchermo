@@ -17,6 +17,14 @@ from flask_socketio import SocketIO, join_room, leave_room
 from urllib.parse import urlparse
 from werkzeug.utils import secure_filename
 
+try:
+    # Europe/Rome e' l'ora di riferimento del palinsesto; su host senza
+    # tzdata di sistema (Windows dev) serve il pacchetto 'tzdata'.
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo(os.environ.get("TZ", "Europe/Rome"))
+except Exception:
+    LOCAL_TZ = timezone.utc
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Percorsi persistenti configurabili via env (volumi Coolify/Docker).
@@ -88,9 +96,14 @@ NEWS_TV_DEFAULTS = {
 
 state_lock = threading.RLock()
 state = {"gruppi": {}, "dispositivi": {}, "app_configs": {},
-         "news_tv": dict(NEWS_TV_DEFAULTS)}
+         "news_tv": dict(NEWS_TV_DEFAULTS), "schedules": []}
 clients = {}            # gruppo -> set di sid connessi
 sid_group = {}          # sid -> gruppo
+# Runtime del palinsesto (non persistito):
+# sched_last:  'g:<gruppo>'/'d:<dev>' -> id fascia applicata ('fallback' = predefinito ripristinato)
+# sched_manual: stessa chiave -> il contenuto e' stato messo in onda a mano
+sched_last = {}
+sched_manual = {}
 device_sids = {}        # device_id -> set di sid connessi
 sid_device = {}         # sid -> device_id
 playlist_workers = {}   # gruppo -> {"stop": Event, "thread": Thread}
@@ -117,6 +130,7 @@ def load_config():
                 state = data
                 state.setdefault("dispositivi", {})
                 state.setdefault("app_configs", {})
+                state.setdefault("schedules", [])
                 _nt = dict(NEWS_TV_DEFAULTS)
                 _nt.update(state.get("news_tv") or {})
                 state["news_tv"] = _nt
@@ -383,6 +397,8 @@ def build_stato():
             "app_configs": {k: dict(v)
                             for k, v in state.get("app_configs", {}).items()},
             "news_tv": dict(state.get("news_tv") or NEWS_TV_DEFAULTS),
+            "schedules": [dict(s) for s in state.get("schedules") or []],
+            "sched_manual": sorted(sched_manual),
             "server_time": now_iso(),
         }
 
@@ -448,6 +464,164 @@ def playlist_worker(nome, stop_ev, advance_ev):
 def emit_content(nome):
     g = get_or_create_gruppo(nome)
     socketio.emit("content", content_payload(g), to=nome)
+
+
+# ---------------------------------------------------------------- Palinsesto
+# Fasce orarie in state['schedules'] (config.json). Un worker in background
+# valuta ogni 30s le regole attive (fuso Europe/Rome) e manda in onda il
+# contenuto previsto. Regole:
+# - 'Metti in onda' manuale marca sched_manual e vince finche' non cambia
+#   la fascia attiva (o fino a 'Riprendi palinsesto').
+# - A fine fascia: ripristina 'default_content' del gruppo (fallback)
+#   oppure rimuove l'override del device tornando al feed di gruppo.
+
+
+def _sched_fallback_available(key):
+    """True se per la chiave esiste un fallback da ripristinare a fine
+    fascia: default_content del gruppo, oppure override attivo sul device
+    (torna al feed di gruppo)."""
+    with state_lock:
+        if key.startswith("d:"):
+            dev = state["dispositivi"].get(key[2:]) or {}
+            return bool((dev.get("contenuto") or {}).get("url"))
+        g = state["gruppi"].get(key[2:]) or {}
+        return bool((g.get("default_content") or {}).get("url"))
+
+
+def _sched_apply_group(nome, url, tipo, mode):
+    """Mette in onda un contenuto sul gruppo (stesso effetto di
+    'Metti in onda'): playlist azzerata, stato aggiornato, emit in room."""
+    if not url:
+        return False
+    with state_lock:
+        g = state["gruppi"].get(nome)
+        if not g:
+            return False
+        tipo = tipo or detect_tipo(url)
+        g["playlist"] = []
+        g["contenuto_attivo"] = url
+        g["tipo"] = tipo
+        g["mode"] = mode if mode in VALID_MODES and mode != "auto" \
+            else "iframe"
+        g["ultimo_aggiornamento"] = now_iso()
+    stop_playlist(nome)
+    emit_content(nome)
+    return True
+
+
+def _sched_apply_device(dev_id, url, tipo, mode):
+    """Imposta/rimuove l'override dedicato del device (url=None ->
+    torna al feed del gruppo), come /api/dispositivi/<id>/contenuto."""
+    with state_lock:
+        dev = state["dispositivi"].get(dev_id)
+        if not dev:
+            return False
+        gname = dev.get("gruppo", UNASSIGNED)
+        if url:
+            dev["contenuto"] = {"url": url, "tipo": tipo or detect_tipo(url),
+                                "mode": mode or "iframe",
+                                "ultimo_aggiornamento": now_iso()}
+        else:
+            dev["contenuto"] = None
+    if url:
+        move_device_room(dev_id, gname, None)
+    else:
+        move_device_room(dev_id, None, gname)
+    emit_to_device(dev_id)
+    return True
+
+
+def sched_tick():
+    """Una valutazione del palinsesto: calcola il contenuto 'voluto' per
+    ogni target e applica solo le differenze rispetto a sched_last."""
+    now = datetime.now(LOCAL_TZ)
+    hhmm = now.strftime("%H:%M")
+    day = now.isoweekday()          # 1 = Lunedi' .. 7 = Domenica
+    with state_lock:
+        scheds = [dict(s) for s in state.get("schedules") or []
+                  if s.get("enabled")]
+        gruppi = list(state["gruppi"])
+    desired = {}                    # 'g:<g>'/'d:<d>' -> fascia attiva
+    for s in scheds:
+        if day not in (s.get("days") or []):
+            continue
+        if not (s.get("start_time", "00:00") <= hhmm
+                < (s.get("end_time") or "23:59")):
+            continue
+        t = s.get("target") or ""
+        if t == "all":
+            keys = ["g:" + n for n in gruppi]
+        elif t.startswith("device:"):
+            keys = ["d:" + t[7:]]
+        else:
+            keys = ["g:" + t[6:] if t.startswith("group:") else "g:" + t]
+        for k in keys:
+            desired.setdefault(k, s)   # in caso di overlap vince la prima regola
+    with state_lock:
+        cands = (set(desired) | set(sched_last) | set(sched_manual)
+                 | {"g:" + n for n, g in state["gruppi"].items()
+                    if g.get("default_content")})
+    applied = False
+    for key in cands:
+        s = desired.get(key)
+        want = s["id"] if s else ("fallback"
+                                  if _sched_fallback_available(key) else None)
+        last = sched_last.get(key)
+        if key in sched_manual:
+            mref = sched_manual[key]
+            if mref is True:
+                # primo tick dopo l'intervento manuale: registra lo stato
+                # che il palinsesto vuole ORA; finche' non cambia il
+                # contenuto manuale resta in onda
+                sched_manual[key] = want
+                continue
+            if want == mref:
+                continue             # stessa fascia/stato: manuale resta
+            sched_manual.pop(key, None)   # fascia cambiata: manuale scade
+        if want == last:
+            continue                 # niente da cambiare
+        if s:
+            url = s.get("content_url") or ""
+            ok = (_sched_apply_device(key[2:], url, s.get("tipo"),
+                                      s.get("mode"))
+                  if key.startswith("d:")
+                  else _sched_apply_group(key[2:], url, s.get("tipo"),
+                                          s.get("mode")))
+            if ok:
+                sched_last[key] = s["id"]
+                sched_manual.pop(key, None)
+                applied = True
+        elif want == "fallback":
+            if key.startswith("d:"):
+                ok = _sched_apply_device(key[2:], None, None, None)
+            else:
+                with state_lock:
+                    d = (state["gruppi"].get(key[2:])
+                         or {}).get("default_content") or {}
+                ok = _sched_apply_group(key[2:], d.get("url"),
+                                        d.get("tipo"), d.get("mode"))
+            if ok:
+                sched_last[key] = "fallback"
+                sched_manual.pop(key, None)
+                applied = True
+        else:
+            sched_last.pop(key, None)
+            sched_manual.pop(key, None)
+    if applied:
+        save_config()
+        broadcast_stato()
+
+
+def scheduler_loop():
+    """Worker in background: valuta il palinsesto ogni 30s. Le eccezioni
+    non devono mai uccidere il worker."""
+    socketio.sleep(5)
+    while True:
+        try:
+            sched_tick()
+        except Exception:
+            pass
+        socketio.sleep(30)
 
 
 # ---------------------------------------------------------------- auth
@@ -867,6 +1041,7 @@ def api_contenuto():
     with state_lock:
         for nome in targets:
             g = state["gruppi"][nome]
+            sched_manual["g:" + nome] = True   # 'Metti in onda' manuale
             g["playlist"] = []
             g["contenuto_attivo"] = url
             g["tipo"] = tipo
@@ -1008,6 +1183,7 @@ def api_dispositivo_contenuto(dev_id):
                                 "ultimo_aggiornamento": now_iso()}
         else:
             dev["contenuto"] = None
+        sched_manual["d:" + dev_id] = True   # override dedicato manuale
     save_config()
     if url or want_idle:
         move_device_room(dev_id, gname, None)   # isola dal feed di gruppo
@@ -1027,6 +1203,8 @@ def api_dispositivo_delete(dev_id):
     'default'; eventuali sid residui vengono sganciati dalle room."""
     with state_lock:
         dev = state.get("dispositivi", {}).pop(dev_id, None)
+        sched_last.pop("d:" + dev_id, None)
+        sched_manual.pop("d:" + dev_id, None)
         if dev is None:
             return jsonify({"ok": False,
                             "error": "Dispositivo sconosciuto"}), 404
@@ -1085,6 +1263,7 @@ def api_playlist():
             clean.append({"url": str(i["url"]), "durata_sec": dur})
         g["playlist"] = clean
         g["ultimo_aggiornamento"] = now_iso()
+        sched_manual["g:" + nome] = True      # playlist impostata a mano
     if clean:
         start_playlist(nome)
     else:
@@ -1102,6 +1281,8 @@ def api_gruppo_delete(nome):
         if nome not in state["gruppi"]:
             return jsonify({"ok": False, "error": "Gruppo inesistente"}), 404
         del state["gruppi"][nome]
+        sched_last.pop("g:" + nome, None)
+        sched_manual.pop("g:" + nome, None)
         # i device assegnati al gruppo eliminato passano al gruppo 'default'
         orphan = [d for d, dev in state["dispositivi"].items()
                   if dev.get("gruppo") == nome]
@@ -1121,6 +1302,157 @@ def api_gruppo_delete(nome):
     save_config()
     broadcast_stato()
     return jsonify({"ok": True, "dispositivi_rilasciati": orphan})
+
+
+# ---------------------------------------------------------------- Palinsesto API
+
+HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+@app.route("/api/schedules", methods=["POST"])
+@requires_auth
+def api_schedules_save():
+    """Crea/aggiorna una fascia del palinsesto.
+    {id?, name?, target: 'all'|'group:<g>'|'device:<d>'|'<g>'|'<d>',
+     content_url, mode?, days:[1..7] (1=Lun), start_time, end_time, enabled?}
+    Con solo {id, enabled} aggiorna lo stato attivo senza validare il resto
+    (toggle dalla tabella)."""
+    data = request.get_json(force=True)
+    sid = str(data.get("id") or "").strip()
+    with state_lock:
+        scheds = state.setdefault("schedules", [])
+        ex = next((x for x in scheds if x.get("id") == sid), None)
+        if ex and not (data.get("content_url") or "").strip():
+            if "enabled" in data:
+                ex["enabled"] = bool(data["enabled"])
+            if data.get("name"):
+                ex["name"] = str(data["name"]).strip()[:80]
+            rec = dict(ex)
+        else:
+            target = str(data.get("target") or "").strip()
+            url = str(data.get("content_url") or "").strip()
+            try:
+                days = sorted({int(d) for d in data.get("days") or []
+                               if 1 <= int(d) <= 7})
+            except (TypeError, ValueError):
+                days = []
+            st = str(data.get("start_time") or "").strip()
+            et = str(data.get("end_time") or "").strip()
+            mode = data.get("mode", "iframe")
+            if mode not in VALID_MODES:
+                mode = "iframe"
+            if target != "all" and not target.startswith(("group:",
+                                                          "device:")):
+                target = ("device:" if target in state["dispositivi"]
+                          else "group:") + target
+            ok_t = (target == "all"
+                    or (target.startswith("group:")
+                        and target[6:] in state["gruppi"])
+                    or (target.startswith("device:")
+                        and target[7:] in state["dispositivi"]))
+            if (not target or not ok_t or not url or not days
+                    or not HHMM.match(st) or not HHMM.match(et) or st >= et):
+                return jsonify({"ok": False,
+                                "error": "Dati fascia non validi "
+                                         "(target, giorni, orari)"}), 400
+            rec = {"id": sid or f"sched_{int(time.time() * 1000)}",
+                   "name": str(data.get("name") or "").strip()[:80] or url,
+                   "target": target, "content_url": url,
+                   "tipo": detect_tipo(url), "mode": mode, "days": days,
+                   "start_time": st, "end_time": et,
+                   "enabled": bool(data.get("enabled", True))}
+            if ex:
+                ex.update(rec)
+                rec = dict(ex)
+                # fascia aggiornata: invalida lo stato runtime cosi' il
+                # contenuto editato viene riapplicato e l'override manuale
+                # scade (l'edit e' un 'cambio fascia')
+                for k in [k for k, v in sched_last.items() if v == rec["id"]]:
+                    sched_last.pop(k, None)
+                for k in [k for k, v in sched_manual.items()
+                          if v == rec["id"]]:
+                    sched_manual.pop(k, None)
+            else:
+                scheds.append(rec)
+    save_config()
+    sched_tick()                 # applicazione immediata se la fascia e' attiva
+    broadcast_stato()
+    return jsonify({"ok": True, "schedule": rec})
+
+
+@app.route("/api/schedules/<sid>", methods=["DELETE"])
+@requires_auth
+def api_schedules_delete(sid):
+    with state_lock:
+        scheds = state.get("schedules") or []
+        if not any(s.get("id") == sid for s in scheds):
+            return jsonify({"ok": False, "error": "Fascia inesistente"}), 404
+        state["schedules"] = [s for s in scheds if s.get("id") != sid]
+    save_config()
+    sched_tick()                 # la fascia appena rimossa puo' liberare target
+    broadcast_stato()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/schedules/resume", methods=["POST"])
+@requires_auth
+def api_schedules_resume():
+    """Annulla l'override manuale e rivaluta subito il palinsesto.
+    {target?: 'g:<gruppo>'|'d:<dev_id>'} — senza target riprende tutto."""
+    data = request.get_json(force=True)
+    t = str(data.get("target") or "").strip()
+    if t:
+        sched_last.pop(t, None)
+        sched_manual.pop(t, None)
+    else:
+        sched_last.clear()
+        sched_manual.clear()
+    sched_tick()
+    broadcast_stato()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/gruppo/<nome>/default", methods=["POST"])
+@requires_auth
+def api_gruppo_default(nome):
+    """Imposta/annulla il contenuto predefinito del gruppo (fallback che il
+    palinsesto ripristina a fine fascia).
+    {use_current: true} copia il contenuto in onda; {url, mode?} lo imposta;
+    {url: null} lo rimuove."""
+    data = request.get_json(force=True)
+    with state_lock:
+        g = state["gruppi"].get(nome)
+        if not g:
+            return jsonify({"ok": False, "error": "Gruppo inesistente"}), 404
+        if data.get("use_current"):
+            url = g.get("contenuto_attivo") or ""
+            if not url:
+                return jsonify({"ok": False,
+                                "error": "Nessun contenuto attivo da copiare"}), 400
+            d = {"url": url, "tipo": g.get("tipo") or detect_tipo(url),
+                 "mode": g.get("mode") or "iframe"}
+        else:
+            url = str(data.get("url") or "").strip()
+            if url:
+                tipo = detect_tipo(url)
+                mode = data.get("mode", "auto")
+                if mode not in VALID_MODES:
+                    mode = "auto"
+                if tipo == "url" and mode == "auto":
+                    mode = "iframe" if check_frameable(url) else "proxy"
+                elif tipo != "url":
+                    mode = "iframe"
+                d = {"url": url, "tipo": tipo, "mode": mode}
+            else:
+                d = None
+        if d:
+            g["default_content"] = d
+        else:
+            g.pop("default_content", None)
+            sched_last.pop("g:" + nome, None)
+    save_config()
+    broadcast_stato()
+    return jsonify({"ok": True, "default_content": d})
 
 
 # ---------------------------------------------------------------- WebSocket
@@ -1219,6 +1551,9 @@ load_config()
 for _nome, _g in list(state["gruppi"].items()):
     if _g.get("playlist"):
         start_playlist(_nome)
+
+# worker del palinsesto: valuta le fasce attive ogni 30s
+socketio.start_background_task(scheduler_loop)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))

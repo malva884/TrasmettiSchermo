@@ -3,7 +3,8 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DATA_DIR=/app/data \
-    MEDIA_DIR=/app/static/media
+    MEDIA_DIR=/app/static/media \
+    TZ=Europe/Rome
 
 WORKDIR /app
 

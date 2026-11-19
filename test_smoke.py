@@ -4,6 +4,7 @@ consegna comandi (content, force_reload) e proxy. Uso:
 """
 import sys
 import time
+from datetime import datetime, timedelta
 
 import requests
 import socketio
@@ -364,6 +365,137 @@ def main():
     requests.delete(f"{BASE}/api/gruppo/ytg", auth=AUTH)
     yt.disconnect()
 
+    # ================= palinsesto (v2.4) =================
+    try:
+        from zoneinfo import ZoneInfo
+        _now = datetime.now(ZoneInfo("Europe/Rome"))
+    except Exception:
+        _now = datetime.now()
+    gsched = "schedgrp"
+    requests.post(f"{BASE}/api/gruppi", auth=AUTH, json={"nome": gsched})
+    sc = socketio.Client()
+    sc_events = []
+    sc.on("content", lambda d: sc_events.append(d))
+    sc.connect(BASE, wait_timeout=5)
+    sc.emit("join_room", {"gruppo": gsched})
+    time.sleep(0.8)
+
+    # contenuto predefinito del gruppo = fallback a fine fascia
+    r = requests.post(f"{BASE}/api/gruppo/{gsched}/default", auth=AUTH,
+                      json={"url": "/media/fallback.png", "mode": "iframe"})
+    assert r.json().get("ok"), r.text
+
+    # dati fascia non validi -> 400
+    r = requests.post(f"{BASE}/api/schedules", auth=AUTH,
+                      json={"name": "bad", "target": f"group:{gsched}",
+                            "content_url": "/media/x.png", "days": [9],
+                            "start_time": "25:00", "end_time": "26:00"})
+    assert r.status_code == 400, r.status_code
+
+    # fascia attiva ORA (Europe/Rome) -> applicata subito al salvataggio
+    st_t = (_now - timedelta(minutes=2)).strftime("%H:%M")
+    et_t = (_now + timedelta(minutes=10)).strftime("%H:%M")
+    if et_t <= st_t:
+        et_t = "23:59"
+    r = requests.post(f"{BASE}/api/schedules", auth=AUTH,
+                      json={"name": "fascia test",
+                            "target": f"group:{gsched}",
+                            "content_url": "/media/sched.png",
+                            "mode": "iframe", "days": [_now.isoweekday()],
+                            "start_time": st_t, "end_time": et_t,
+                            "enabled": True})
+    assert r.json().get("ok"), r.text
+    sid = r.json()["schedule"]["id"]
+    time.sleep(1.0)
+    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    assert s["gruppi"][gsched]["contenuto_attivo"] == "/media/sched.png", \
+        s["gruppi"][gsched]
+    assert sc_events and \
+        sc_events[-1]["url"].startswith("/media/sched.png"), sc_events
+
+    # 'Metti in onda' manuale: marca l'override; la STESSA fascia attiva
+    # non deve riprendere il controllo (tick forzato via toggle no-op)
+    r = requests.post(f"{BASE}/api/contenuto", auth=AUTH,
+                      json={"gruppi": [gsched], "url": "/media/manual.png",
+                            "mode": "iframe"})
+    assert r.json().get("ok"), r.text
+    r = requests.post(f"{BASE}/api/schedules", auth=AUTH,
+                      json={"id": sid, "enabled": True})
+    assert r.json().get("ok"), r.text
+    time.sleep(0.5)
+    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    assert s["gruppi"][gsched]["contenuto_attivo"] == "/media/manual.png", \
+        "il palinsesto ha sovrascritto l'override manuale"
+    assert f"g:{gsched}" in s["sched_manual"], s["sched_manual"]
+
+    # fine fascia (toggle off) -> manuale scade, torna il predefinito
+    r = requests.post(f"{BASE}/api/schedules", auth=AUTH,
+                      json={"id": sid, "enabled": False})
+    assert r.json().get("ok"), r.text
+    time.sleep(0.8)
+    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    assert f"g:{gsched}" not in s["sched_manual"], s["sched_manual"]
+    assert s["gruppi"][gsched]["contenuto_attivo"] == \
+        "/media/fallback.png", s["gruppi"][gsched]
+
+    # override manuale + 'Riprendi palinsesto' -> torna il predefinito
+    requests.post(f"{BASE}/api/contenuto", auth=AUTH,
+                  json={"gruppi": [gsched], "url": "/media/manual2.png",
+                        "mode": "iframe"})
+    r = requests.post(f"{BASE}/api/schedules/resume", auth=AUTH, json={})
+    assert r.json().get("ok"), r.text
+    time.sleep(0.8)
+    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    assert s["gruppi"][gsched]["contenuto_attivo"] == \
+        "/media/fallback.png", s["gruppi"][gsched]
+    assert not s["sched_manual"], s["sched_manual"]
+
+    # fascia su device singolo: l'override manuale vince fino al resume
+    # mirato, poi la fascia applica il contenuto dedicato; a fine fascia
+    # (delete) il device torna al feed del gruppo
+    dev2 = socketio.Client()
+    dev2_events = []
+    dev2.on("content", lambda d: dev2_events.append(d))
+    dev2.connect(BASE, wait_timeout=5)
+    dev2.emit("join_room", {"device_id": "TV-TEST1"})
+    time.sleep(0.8)
+    requests.post(f"{BASE}/api/dispositivi/TV-TEST1/contenuto", auth=AUTH,
+                  json={"url": "/media/devmanual.png", "mode": "iframe"})
+    r = requests.post(f"{BASE}/api/schedules", auth=AUTH,
+                      json={"name": "fascia dev",
+                            "target": "device:TV-TEST1",
+                            "content_url": "/media/devsched.png",
+                            "mode": "iframe", "days": [_now.isoweekday()],
+                            "start_time": st_t, "end_time": et_t,
+                            "enabled": True})
+    assert r.json().get("ok"), r.text
+    dsid = r.json()["schedule"]["id"]
+    time.sleep(0.8)
+    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    dc = s["dispositivi"]["TV-TEST1"].get("contenuto") or {}
+    assert dc.get("url") == "/media/devmanual.png", \
+        "la fascia non doveva scavaliare l'override manuale del device"
+    r = requests.post(f"{BASE}/api/schedules/resume", auth=AUTH,
+                      json={"target": "d:TV-TEST1"})
+    assert r.json().get("ok"), r.text
+    time.sleep(0.8)
+    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    dc = s["dispositivi"]["TV-TEST1"].get("contenuto") or {}
+    assert dc.get("url") == "/media/devsched.png", dc
+    assert dev2_events and dev2_events[-1].get("dedicato"), dev2_events
+    r = requests.delete(f"{BASE}/api/schedules/{dsid}", auth=AUTH)
+    assert r.json().get("ok"), r.text
+    time.sleep(0.8)
+    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    assert s["dispositivi"]["TV-TEST1"].get("contenuto") is None, \
+        s["dispositivi"]["TV-TEST1"]
+    dev2.disconnect()
+
+    # cleanup palinsesto: fascia e gruppo di test
+    requests.delete(f"{BASE}/api/schedules/{sid}", auth=AUTH)
+    requests.delete(f"{BASE}/api/gruppo/{gsched}", auth=AUTH)
+    sc.disconnect()
+
     print("TUTTI I TEST PASSATI: content, cache-buster, force_reload, "
           "proxy 400/403, client count, device register(default)/identify/"
           "rename/reassign/override-dedicato/gruppi-create/"
@@ -371,7 +503,9 @@ def main():
           "apps routes/weather-proxy/app_configs CRUD/auth, "
           "youtube tipo/playlist_next, "
           "news_tv routes/stream-override/settings-api, "
-          "broadcast-exclude-default, device-pairing-idle")
+          "broadcast-exclude-default, device-pairing-idle, "
+          "schedules CRUD/toggle/resume/manual-override/"
+          "fallback-gruppo/device-schedule")
 
 
 if __name__ == "__main__":

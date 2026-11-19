@@ -22,6 +22,7 @@ python main.py
 | `DEFAULT_CONTENT_URL` | *(vuoto)* | Contenuto assegnato ai gruppi appena creati |
 | `DATA_DIR` | `./data` | Directory dati persistenti (`config.json` → `$DATA_DIR/config.json`) |
 | `MEDIA_DIR` | `./media` | Directory dei media caricati, serviti su `/media/` |
+| `TZ` | `Europe/Rome` | Fuso orario del palinsesto (nel Dockerfile già impostato) |
 
 PowerShell (sessione corrente):
 ```powershell
@@ -52,6 +53,33 @@ Dockerfile           immagine produzione (Gunicorn + gevent, 1 worker)
 - **Contatore client connessi** per gruppo, in tempo reale nel pannello admin
 - **Targeting**: singolo gruppo, sottoinsieme (checkbox) o broadcast "Tutti"
 - **Guida setup dispositivi** in `/admin` (pulsante in topbar): URL player dinamico + QR code, istruzioni kiosk per Fire TV Stick, Android/Google TV, Samsung/LG, Mini-PC Windows, Raspberry/Linux e tablet
+
+## Palinsesto
+
+La sezione **Palinsesto** dell'admin gestisce fasce orarie persistenti
+(`config.json → schedules`): ogni fascia ha nome, destinatario (tutti i gruppi,
+singolo gruppo o singolo schermo), contenuto (app salvata, media o URL
+personalizzato), giorni della settimana, orario `start`–`end` e stato
+attiva/disattiva.
+
+Un worker in background valuta le fasce **ogni 30 secondi** sull'orologio
+`Europe/Rome` e manda in onda il contenuto previsto con lo stesso evento
+Socket.IO `content` di "Metti in onda" (per i device: override dedicato nella
+room `dev:<id>`).
+
+Regole di arbitrio:
+
+- **Override manuale**: "Metti in onda", playlist e contenuto dedicato ai
+  device marcano il target come manuale. Il contenuto manuale resta attivo
+  fino al **cambio della fascia attiva** (inizio/fine fascia o cambio
+  contenuto) oppure finché non si preme **"Riprendi palinsesto"** nel banner
+  ambra in cima alla vista (o `POST /api/schedules/resume`).
+- **Fallback a fine fascia**: se il gruppo ha un **contenuto predefinito**
+  (`gruppo → menu ⋯ → "Predefinito = contenuto attuale"`, salvato in
+  `default_content`) viene rimandato in onda al termine della fascia;
+  altrimenti resta l'ultimo contenuto. Per un device, a fine fascia
+  l'override dedicato viene rimosso e torna al feed del gruppo.
+- In caso di fasce sovrapposte sullo stesso target vince la prima nell'elenco.
 
 ## App & Widget
 
@@ -102,6 +130,10 @@ Il `Dockerfile` avvia Gunicorn con `GeventWebSocketWorker` (**un solo worker**: 
 2. Impostare `ADMIN_PASSWORD` (e opzionalmente `ADMIN_USER`) nelle variabili d'ambiente.
 3. Montare i due volumi della tabella sopra.
 4. Healthcheck: `GET /health` → `200 {"status":"ok"}` (pubblico, senza Basic Auth; il Dockerfile include già un `HEALTHCHECK`).
+
+Il container gira in **UTC** di default: il Dockerfile imposta `TZ=Europe/Rome`
+e installa `tzdata`, quindi il palinsesto segue l'ora italiana anche su
+Coolify. Per un fuso diverso basta ridefinire `TZ`.
 
 Note: upload fino a **250 MB** (`MAX_CONTENT_LENGTH`); se davanti c'è un ulteriore proxy (Nginx/Traefik custom), allineare `client_max_body_size`/limiti upload. Il client Socket.IO usa `transports:["websocket","polling"]` sull'origine corrente — niente Mixed Content in HTTPS.
 
@@ -156,4 +188,8 @@ sudo systemctl enable --now signage
 | GET | `/api/apps/geocode` | `?city=..` | Geocoding Open-Meteo (admin) |
 | GET | `/api/apps/weather_data` | `?lat=..&lon=..` | Proxy meteo pubblico, cache 30 min |
 | POST | `/api/apps/news_tv` | `{skytg24?, rainews24?}` | Sorgenti dirette in `config.json → news_tv` |
+| POST | `/api/schedules` | `{id?, name, target, content_url, mode?, days:[1..7], start_time, end_time, enabled?}` | Crea/aggiorna fascia; con solo `{id, enabled}` = toggle |
+| DELETE | `/api/schedules/<id>` | — | Elimina fascia |
+| POST | `/api/schedules/resume` | `{target?}` | Annulla override manuali e rivaluta subito il palinsesto |
+| POST | `/api/gruppo/<nome>/default` | `{use_current?}`/`{url, mode?}`/`{url:null}` | Imposta/rimuove il contenuto predefinito (fallback) |
 | DELETE | `/api/gruppo/<nome>` | — | Elimina gruppo |
