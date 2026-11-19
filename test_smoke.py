@@ -2,9 +2,11 @@
 consegna comandi (content, force_reload) e proxy. Uso:
     python test_smoke.py   (con il server gia' avviato su :5000)
 """
+import json
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import requests
 import socketio
@@ -179,7 +181,7 @@ def main():
     dev_events.clear()
     requests.post(f"{BASE}/api/dispositivi/TV-TEST1/contenuto", auth=AUTH,
                   json={"url": None})
-    time.sleep(0.8)
+    time.sleep(1.5)
     assert dev_events and dev_events[-1]["url"].startswith("/media/other.png"), \
         dev_events
 
@@ -202,7 +204,7 @@ def main():
     dev_events.clear()
     requests.post(f"{BASE}/api/dispositivi/TV-TEST1/contenuto", auth=AUTH,
                   json={"url": None})
-    time.sleep(0.8)
+    time.sleep(1.5)
     assert dev_events and dev_events[-1]["url"].startswith("/media/z.png"), \
         dev_events
 
@@ -352,12 +354,12 @@ def main():
     assert yt_events and yt_events[-1]["tipo"] == "youtube", yt_events
     assert yt_events[-1]["playlist_attiva"], yt_events
     yt.emit("playlist_next", {"url": "https://youtu.be/dQw4w9WgXcQ"})
-    time.sleep(1.2)
+    time.sleep(2.5)  # margine: sotto carico l'emit della slide arriva in ~2s
     assert yt_events[-1]["url"].startswith("/media/x.png"), yt_events
 
     # segnale stale (slide gia' cambiata) -> ignorato, nessun avanzamento
     yt.emit("playlist_next", {"url": "https://youtu.be/dQw4w9WgXcQ"})
-    time.sleep(1.0)
+    time.sleep(1.2)
     assert yt_events[-1]["url"].startswith("/media/x.png"), yt_events
 
     requests.post(f"{BASE}/api/playlist", auth=AUTH,
@@ -380,9 +382,13 @@ def main():
     sc.emit("join_room", {"gruppo": gsched})
     time.sleep(0.8)
 
-    # contenuto predefinito del gruppo = fallback a fine fascia
-    r = requests.post(f"{BASE}/api/gruppo/{gsched}/default", auth=AUTH,
-                      json={"url": "/media/fallback.png", "mode": "iframe"})
+    # contenuto base del gruppo (assegnazione manuale) + resume per
+    # sbloccare il flag manuale: da qui in poi comanda il palinsesto
+    r = requests.post(f"{BASE}/api/contenuto", auth=AUTH,
+                      json={"gruppi": [gsched], "url": "/media/base.png",
+                            "mode": "iframe"})
+    assert r.json().get("ok"), r.text
+    r = requests.post(f"{BASE}/api/schedules/resume", auth=AUTH, json={})
     assert r.json().get("ok"), r.text
 
     # dati fascia non validi -> 400
@@ -392,7 +398,8 @@ def main():
                             "start_time": "25:00", "end_time": "26:00"})
     assert r.status_code == 400, r.status_code
 
-    # fascia attiva ORA (Europe/Rome) -> applicata subito al salvataggio
+    # fascia attiva ORA (Europe/Rome) -> overlay emesso subito, ma il
+    # contenuto base persistito NON viene toccato
     st_t = (_now - timedelta(minutes=2)).strftime("%H:%M")
     et_t = (_now + timedelta(minutes=10)).strftime("%H:%M")
     if et_t <= st_t:
@@ -408,10 +415,20 @@ def main():
     sid = r.json()["schedule"]["id"]
     time.sleep(1.0)
     s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
-    assert s["gruppi"][gsched]["contenuto_attivo"] == "/media/sched.png", \
-        s["gruppi"][gsched]
+    # BUG CHECK: il campo persistente resta il contenuto base
+    assert s["gruppi"][gsched]["contenuto_attivo"] == "/media/base.png", \
+        "lo scheduler ha sovrascritto contenuto_attivo"
+    assert s["sched_active"].get(f"g:{gsched}", {}).get("sched_id") == sid, \
+        s["sched_active"]
     assert sc_events and \
         sc_events[-1]["url"].startswith("/media/sched.png"), sc_events
+    # stessa verifica sul file di config persistito (data/ o root legacy)
+    cfg_path = Path("data/config.json")
+    if not cfg_path.exists():
+        cfg_path = Path("config.json")
+    cfg = json.loads(cfg_path.read_text())
+    assert cfg["gruppi"][gsched]["contenuto_attivo"] == "/media/base.png", \
+        cfg["gruppi"][gsched]
 
     # 'Metti in onda' manuale: marca l'override; la STESSA fascia attiva
     # non deve riprendere il controllo (tick forzato via toggle no-op)
@@ -424,35 +441,39 @@ def main():
     assert r.json().get("ok"), r.text
     time.sleep(0.5)
     s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
-    assert s["gruppi"][gsched]["contenuto_attivo"] == "/media/manual.png", \
-        "il palinsesto ha sovrascritto l'override manuale"
+    assert s["gruppi"][gsched]["contenuto_attivo"] == "/media/manual.png"
     assert f"g:{gsched}" in s["sched_manual"], s["sched_manual"]
+    assert sc_events and \
+        sc_events[-1]["url"].startswith("/media/manual.png"), sc_events
 
-    # fine fascia (toggle off) -> manuale scade, torna il predefinito
+    # fine fascia (toggle off) -> manuale scade, torna il contenuto base
+    # (contenuto_attivo = ultimo contenuto messo in onda dall'operatore)
     r = requests.post(f"{BASE}/api/schedules", auth=AUTH,
                       json={"id": sid, "enabled": False})
     assert r.json().get("ok"), r.text
     time.sleep(0.8)
     s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
     assert f"g:{gsched}" not in s["sched_manual"], s["sched_manual"]
-    assert s["gruppi"][gsched]["contenuto_attivo"] == \
-        "/media/fallback.png", s["gruppi"][gsched]
+    assert s["gruppi"][gsched]["contenuto_attivo"] == "/media/manual.png"
+    assert sc_events and \
+        sc_events[-1]["url"].startswith("/media/manual.png"), sc_events
 
-    # override manuale + 'Riprendi palinsesto' -> torna il predefinito
+    # contenuto base vuoto -> fallback su default_content del gruppo
     requests.post(f"{BASE}/api/contenuto", auth=AUTH,
-                  json={"gruppi": [gsched], "url": "/media/manual2.png",
-                        "mode": "iframe"})
-    r = requests.post(f"{BASE}/api/schedules/resume", auth=AUTH, json={})
+                  json={"gruppi": [gsched], "url": "", "mode": "iframe"})
+    r = requests.post(f"{BASE}/api/gruppo/{gsched}/default", auth=AUTH,
+                      json={"url": "/media/fallback.png", "mode": "iframe"})
+    assert r.json().get("ok"), r.text
+    r = requests.post(f"{BASE}/api/schedules/resume", auth=AUTH,
+                      json={"target": f"g:{gsched}"})
     assert r.json().get("ok"), r.text
     time.sleep(0.8)
-    s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
-    assert s["gruppi"][gsched]["contenuto_attivo"] == \
-        "/media/fallback.png", s["gruppi"][gsched]
-    assert not s["sched_manual"], s["sched_manual"]
+    assert sc_events and \
+        sc_events[-1]["url"].startswith("/media/fallback.png"), sc_events
 
-    # fascia su device singolo: l'override manuale vince fino al resume
-    # mirato, poi la fascia applica il contenuto dedicato; a fine fascia
-    # (delete) il device torna al feed del gruppo
+    # fascia su device singolo: overlay sopra il dedicato manuale; i
+    # campi persistenti del device restano intatti e a fine fascia si
+    # torna esattamente al contenuto base del device
     dev2 = socketio.Client()
     dev2_events = []
     dev2.on("content", lambda d: dev2_events.append(d))
@@ -480,15 +501,24 @@ def main():
     assert r.json().get("ok"), r.text
     time.sleep(0.8)
     s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
+    # BUG CHECK: overlay in onda, ma dev.contenuto resta il manuale
     dc = s["dispositivi"]["TV-TEST1"].get("contenuto") or {}
-    assert dc.get("url") == "/media/devsched.png", dc
-    assert dev2_events and dev2_events[-1].get("dedicato"), dev2_events
+    assert dc.get("url") == "/media/devmanual.png", dc
+    assert s["sched_active"].get("d:TV-TEST1", {}).get("sched_id") == dsid
+    assert dev2_events and \
+        dev2_events[-1]["url"].startswith("/media/devsched.png"), dev2_events
+    # fine fascia -> torna il base del device (il dedicato manuale)
     r = requests.delete(f"{BASE}/api/schedules/{dsid}", auth=AUTH)
     assert r.json().get("ok"), r.text
     time.sleep(0.8)
     s = requests.get(f"{BASE}/api/stato", auth=AUTH).json()
-    assert s["dispositivi"]["TV-TEST1"].get("contenuto") is None, \
-        s["dispositivi"]["TV-TEST1"]
+    dc = s["dispositivi"]["TV-TEST1"].get("contenuto") or {}
+    assert dc.get("url") == "/media/devmanual.png", dc
+    assert "d:TV-TEST1" not in s["sched_active"], s["sched_active"]
+    assert dev2_events and \
+        dev2_events[-1]["url"].startswith("/media/devmanual.png"), dev2_events
+    requests.post(f"{BASE}/api/dispositivi/TV-TEST1/contenuto", auth=AUTH,
+                  json={"url": None})
     dev2.disconnect()
 
     # cleanup palinsesto: fascia e gruppo di test
@@ -505,7 +535,7 @@ def main():
           "news_tv routes/stream-override/settings-api, "
           "broadcast-exclude-default, device-pairing-idle, "
           "schedules CRUD/toggle/resume/manual-override/"
-          "fallback-gruppo/device-schedule")
+          "overlay-base-intatto/fallback-gruppo/device-schedule")
 
 
 if __name__ == "__main__":

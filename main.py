@@ -99,10 +99,14 @@ state = {"gruppi": {}, "dispositivi": {}, "app_configs": {},
          "news_tv": dict(NEWS_TV_DEFAULTS), "schedules": []}
 clients = {}            # gruppo -> set di sid connessi
 sid_group = {}          # sid -> gruppo
-# Runtime del palinsesto (non persistito):
-# sched_last:  'g:<gruppo>'/'d:<dev>' -> id fascia applicata ('fallback' = predefinito ripristinato)
-# sched_manual: stessa chiave -> il contenuto e' stato messo in onda a mano
-sched_last = {}
+# Runtime del palinsesto (NON persistito in config.json):
+# sched_active: 'g:<gruppo>'/'d:<dev>' -> fascia in onda come overlay
+#               {sched_id,url,tipo,mode}. Solo eventi Socket.IO: i campi
+#               persistenti (contenuto_attivo / dev.contenuto) non vengono
+#               mai toccati dallo scheduler.
+# sched_manual: stessa chiave -> contenuto messo in onda a mano: vince il
+#               palinsesto fino al cambio fascia (o 'Riprendi palinsesto')
+sched_active = {}
 sched_manual = {}
 device_sids = {}        # device_id -> set di sid connessi
 sid_device = {}         # sid -> device_id
@@ -337,10 +341,16 @@ def emit_to_device(dev_id):
         own = dev.get("contenuto") or {}
         gname = dev.get("gruppo", UNASSIGNED)
         g = state["gruppi"].get(gname)
+        ov_dev = sched_active.get("d:" + dev_id)
+        ov_grp = sched_active.get("g:" + gname)
     if own.get("tipo") in ("idle", "none") and not own.get("url"):
         # override "schermata pairing": il device mostra la schermata
         # d'attesa con il suo codice, isolato dal feed del gruppo
         payload = idle_payload()
+    elif ov_dev:
+        # fascia palinsesto sul device: vince anche su contenuto dedicato
+        # rimasto in stato (il manuale scade al cambio fascia)
+        payload = _sched_payload(ov_dev)
     elif own.get("url"):
         url = own["url"]
         payload = {
@@ -351,14 +361,17 @@ def emit_to_device(dev_id):
             "ultimo_aggiornamento": own.get("ultimo_aggiornamento"),
             "playlist_attiva": False,
         }
+    elif ov_grp:
+        # fascia palinsesto sul gruppo del device
+        payload = _sched_payload(ov_grp)
     elif g:
-        payload = content_payload(g)
+        payload = gruppo_base_payload(g)
     else:
         payload = idle_payload()
     payload["device_id"] = dev_id
     payload["device_nome"] = dev.get("nome") or dev_id
     payload["gruppo"] = gname
-    payload["dedicato"] = bool(own)
+    payload["dedicato"] = bool(own) or bool(ov_dev)
     socketio.emit("content", payload, to=f"dev:{dev_id}")
 
 
@@ -398,6 +411,7 @@ def build_stato():
                             for k, v in state.get("app_configs", {}).items()},
             "news_tv": dict(state.get("news_tv") or NEWS_TV_DEFAULTS),
             "schedules": [dict(s) for s in state.get("schedules") or []],
+            "sched_active": {k: dict(v) for k, v in sched_active.items()},
             "sched_manual": sorted(sched_manual),
             "server_time": now_iso(),
         }
@@ -428,6 +442,12 @@ def start_playlist(nome):
 def playlist_worker(nome, stop_ev, advance_ev):
     idx = 0
     while not stop_ev.is_set():
+        if sched_active.get("g:" + nome):
+            # fascia palinsesto in onda: la playlist resta in pausa e
+            # riprende da dove era quando la fascia termina
+            advance_ev.wait(5)
+            advance_ev.clear()
+            continue
         with state_lock:
             g = state["gruppi"].get(nome)
             items = (g or {}).get("playlist") or []
@@ -463,77 +483,82 @@ def playlist_worker(nome, stop_ev, advance_ev):
 
 def emit_content(nome):
     g = get_or_create_gruppo(nome)
-    socketio.emit("content", content_payload(g), to=nome)
+    ov = sched_active.get("g:" + nome)
+    socketio.emit("content",
+                  _sched_payload(ov) if ov else gruppo_base_payload(g),
+                  to=nome)
 
 
 # ---------------------------------------------------------------- Palinsesto
 # Fasce orarie in state['schedules'] (config.json). Un worker in background
 # valuta ogni 30s le regole attive (fuso Europe/Rome) e manda in onda il
 # contenuto previsto. Regole:
+# - La fascia e' un OVERLAY runtime (sched_active): lo scheduler emette
+#   solo eventi Socket.IO 'content' e non scrive MAI contenuto_attivo /
+#   dev.contenuto / default_content, che restano il contenuto base
+#   impostato dall'operatore e sopravvivono al reboot.
 # - 'Metti in onda' manuale marca sched_manual e vince finche' non cambia
 #   la fascia attiva (o fino a 'Riprendi palinsesto').
-# - A fine fascia: ripristina 'default_content' del gruppo (fallback)
-#   oppure rimuove l'override del device tornando al feed di gruppo.
+# - A fine fascia: ripristina il contenuto base del gruppo
+#   (contenuto_attivo -> default_content -> attesa) o riporta il device
+#   nel feed del suo gruppo.
 
 
-def _sched_fallback_available(key):
-    """True se per la chiave esiste un fallback da ripristinare a fine
-    fascia: default_content del gruppo, oppure override attivo sul device
-    (torna al feed di gruppo)."""
-    with state_lock:
-        if key.startswith("d:"):
-            dev = state["dispositivi"].get(key[2:]) or {}
-            return bool((dev.get("contenuto") or {}).get("url"))
-        g = state["gruppi"].get(key[2:]) or {}
-        return bool((g.get("default_content") or {}).get("url"))
+def _sched_payload(ov):
+    """Payload 'content' per una fascia del palinsesto in onda."""
+    url = ov.get("url") or ""
+    return {"url": cache_busted(url), "url_raw": url,
+            "tipo": ov.get("tipo") or detect_tipo(url),
+            "mode": ov.get("mode") or "iframe",
+            "ultimo_aggiornamento": now_iso(),
+            "playlist_attiva": False,
+            "sched_id": ov.get("sched_id")}
 
 
-def _sched_apply_group(nome, url, tipo, mode):
-    """Mette in onda un contenuto sul gruppo (stesso effetto di
-    'Metti in onda'): playlist azzerata, stato aggiornato, emit in room."""
-    if not url:
-        return False
-    with state_lock:
-        g = state["gruppi"].get(nome)
-        if not g:
-            return False
-        tipo = tipo or detect_tipo(url)
-        g["playlist"] = []
-        g["contenuto_attivo"] = url
-        g["tipo"] = tipo
-        g["mode"] = mode if mode in VALID_MODES and mode != "auto" \
-            else "iframe"
-        g["ultimo_aggiornamento"] = now_iso()
-    stop_playlist(nome)
-    emit_content(nome)
-    return True
+def gruppo_base_payload(g):
+    """Payload del contenuto base del gruppo (quello persistito):
+    contenuto_attivo -> default_content -> attesa (url vuoto)."""
+    if (g.get("contenuto_attivo") or "").strip():
+        return content_payload(g)
+    d = g.get("default_content") or {}
+    if d.get("url"):
+        url = d["url"]
+        return {"url": cache_busted(url), "url_raw": url,
+                "tipo": d.get("tipo") or detect_tipo(url),
+                "mode": d.get("mode") or "iframe",
+                "ultimo_aggiornamento": g.get("ultimo_aggiornamento"),
+                "playlist_attiva": False}
+    return content_payload(g)
 
 
-def _sched_apply_device(dev_id, url, tipo, mode):
-    """Imposta/rimuove l'override dedicato del device (url=None ->
-    torna al feed del gruppo), come /api/dispositivi/<id>/contenuto."""
-    with state_lock:
-        dev = state["dispositivi"].get(dev_id)
-        if not dev:
-            return False
-        gname = dev.get("gruppo", UNASSIGNED)
-        if url:
-            dev["contenuto"] = {"url": url, "tipo": tipo or detect_tipo(url),
-                                "mode": mode or "iframe",
-                                "ultimo_aggiornamento": now_iso()}
+def _sched_emit_target(key):
+    """Emette lo stato corrente di un target (overlay palinsesto o base).
+    Per i device gestisce anche l'isolamento dalla room del gruppo."""
+    if key.startswith("d:"):
+        dev_id = key[2:]
+        with state_lock:
+            dev = state["dispositivi"].get(dev_id)
+            if not dev:
+                sched_active.pop(key, None)
+                return
+            gname = dev.get("gruppo", UNASSIGNED)
+        if sched_active.get(key):
+            move_device_room(dev_id, gname, None)   # isola dal feed di gruppo
         else:
-            dev["contenuto"] = None
-    if url:
-        move_device_room(dev_id, gname, None)
+            move_device_room(dev_id, None, gname)   # rientra nel feed
+        emit_to_device(dev_id)
     else:
-        move_device_room(dev_id, None, gname)
-    emit_to_device(dev_id)
-    return True
+        with state_lock:
+            if key[2:] not in state["gruppi"]:
+                sched_active.pop(key, None)
+                return
+        emit_content(key[2:])
 
 
 def sched_tick():
-    """Una valutazione del palinsesto: calcola il contenuto 'voluto' per
-    ogni target e applica solo le differenze rispetto a sched_last."""
+    """Una valutazione del palinsesto: calcola la fascia 'voluta' per ogni
+    target e applica solo i cambi rispetto a sched_active. Nessuna
+    scrittura sui campi persistenti del gruppo/device."""
     now = datetime.now(LOCAL_TZ)
     hhmm = now.strftime("%H:%M")
     day = now.isoweekday()          # 1 = Lunedi' .. 7 = Domenica
@@ -558,15 +583,11 @@ def sched_tick():
         for k in keys:
             desired.setdefault(k, s)   # in caso di overlap vince la prima regola
     with state_lock:
-        cands = (set(desired) | set(sched_last) | set(sched_manual)
-                 | {"g:" + n for n, g in state["gruppi"].items()
-                    if g.get("default_content")})
+        cands = set(desired) | set(sched_active) | set(sched_manual)
     applied = False
     for key in cands:
         s = desired.get(key)
-        want = s["id"] if s else ("fallback"
-                                  if _sched_fallback_available(key) else None)
-        last = sched_last.get(key)
+        want = s["id"] if s else "base"
         if key in sched_manual:
             mref = sched_manual[key]
             if mref is True:
@@ -578,37 +599,23 @@ def sched_tick():
             if want == mref:
                 continue             # stessa fascia/stato: manuale resta
             sched_manual.pop(key, None)   # fascia cambiata: manuale scade
+        cur = sched_active.get(key)
+        last = cur["sched_id"] if cur else "base"
         if want == last:
             continue                 # niente da cambiare
         if s:
-            url = s.get("content_url") or ""
-            ok = (_sched_apply_device(key[2:], url, s.get("tipo"),
-                                      s.get("mode"))
-                  if key.startswith("d:")
-                  else _sched_apply_group(key[2:], url, s.get("tipo"),
-                                          s.get("mode")))
-            if ok:
-                sched_last[key] = s["id"]
-                sched_manual.pop(key, None)
-                applied = True
-        elif want == "fallback":
-            if key.startswith("d:"):
-                ok = _sched_apply_device(key[2:], None, None, None)
-            else:
-                with state_lock:
-                    d = (state["gruppi"].get(key[2:])
-                         or {}).get("default_content") or {}
-                ok = _sched_apply_group(key[2:], d.get("url"),
-                                        d.get("tipo"), d.get("mode"))
-            if ok:
-                sched_last[key] = "fallback"
-                sched_manual.pop(key, None)
-                applied = True
-        else:
-            sched_last.pop(key, None)
+            sched_active[key] = {"sched_id": s["id"],
+                                 "url": s.get("content_url") or "",
+                                 "tipo": s.get("tipo"),
+                                 "mode": s.get("mode")}
             sched_manual.pop(key, None)
+        else:
+            # fine fascia: torna al contenuto base (intatto, non
+            # sovrascritto dal palinsesto)
+            sched_active.pop(key, None)
+        _sched_emit_target(key)
+        applied = True
     if applied:
-        save_config()
         broadcast_stato()
 
 
@@ -1042,6 +1049,7 @@ def api_contenuto():
         for nome in targets:
             g = state["gruppi"][nome]
             sched_manual["g:" + nome] = True   # 'Metti in onda' manuale
+            sched_active.pop("g:" + nome, None)  # il manuale sostituisce l'overlay
             g["playlist"] = []
             g["contenuto_attivo"] = url
             g["tipo"] = tipo
@@ -1184,6 +1192,7 @@ def api_dispositivo_contenuto(dev_id):
         else:
             dev["contenuto"] = None
         sched_manual["d:" + dev_id] = True   # override dedicato manuale
+        sched_active.pop("d:" + dev_id, None)
     save_config()
     if url or want_idle:
         move_device_room(dev_id, gname, None)   # isola dal feed di gruppo
@@ -1203,7 +1212,7 @@ def api_dispositivo_delete(dev_id):
     'default'; eventuali sid residui vengono sganciati dalle room."""
     with state_lock:
         dev = state.get("dispositivi", {}).pop(dev_id, None)
-        sched_last.pop("d:" + dev_id, None)
+        sched_active.pop("d:" + dev_id, None)
         sched_manual.pop("d:" + dev_id, None)
         if dev is None:
             return jsonify({"ok": False,
@@ -1264,6 +1273,7 @@ def api_playlist():
         g["playlist"] = clean
         g["ultimo_aggiornamento"] = now_iso()
         sched_manual["g:" + nome] = True      # playlist impostata a mano
+        sched_active.pop("g:" + nome, None)   # la playlist sostituisce l'overlay
     if clean:
         start_playlist(nome)
     else:
@@ -1281,7 +1291,7 @@ def api_gruppo_delete(nome):
         if nome not in state["gruppi"]:
             return jsonify({"ok": False, "error": "Gruppo inesistente"}), 404
         del state["gruppi"][nome]
-        sched_last.pop("g:" + nome, None)
+        sched_active.pop("g:" + nome, None)
         sched_manual.pop("g:" + nome, None)
         # i device assegnati al gruppo eliminato passano al gruppo 'default'
         orphan = [d for d, dev in state["dispositivi"].items()
@@ -1367,8 +1377,9 @@ def api_schedules_save():
                 # fascia aggiornata: invalida lo stato runtime cosi' il
                 # contenuto editato viene riapplicato e l'override manuale
                 # scade (l'edit e' un 'cambio fascia')
-                for k in [k for k, v in sched_last.items() if v == rec["id"]]:
-                    sched_last.pop(k, None)
+                for k in [k for k, v in sched_active.items()
+                          if v.get("sched_id") == rec["id"]]:
+                    sched_active.pop(k, None)
                 for k in [k for k, v in sched_manual.items()
                           if v == rec["id"]]:
                     sched_manual.pop(k, None)
@@ -1402,10 +1413,10 @@ def api_schedules_resume():
     data = request.get_json(force=True)
     t = str(data.get("target") or "").strip()
     if t:
-        sched_last.pop(t, None)
+        sched_active.pop(t, None)
         sched_manual.pop(t, None)
     else:
-        sched_last.clear()
+        sched_active.clear()
         sched_manual.clear()
     sched_tick()
     broadcast_stato()
@@ -1449,8 +1460,8 @@ def api_gruppo_default(nome):
             g["default_content"] = d
         else:
             g.pop("default_content", None)
-            sched_last.pop("g:" + nome, None)
     save_config()
+    emit_content(nome)              # aggiorna subito il base se non c'e' fascia
     broadcast_stato()
     return jsonify({"ok": True, "default_content": d})
 
@@ -1477,9 +1488,11 @@ def on_join(data):
         device_sids.setdefault(dev_id, set()).add(sid)
         sid_device[sid] = dev_id
         group = dev["gruppo"]
-        # niente room di gruppo se il device ha contenuto dedicato
+        # niente room di gruppo se il device ha contenuto dedicato o una
+        # fascia palinsesto attiva (sched_active lo isola dal feed)
         if (group and group != UNASSIGNED and group in state["gruppi"]
-                and not (dev.get("contenuto") or {}).get("url")):
+                and not (dev.get("contenuto") or {}).get("url")
+                and not sched_active.get("d:" + dev_id)):
             join_room(group)
             sid_group[sid] = group
             clients.setdefault(group, set()).add(sid)
