@@ -1196,7 +1196,12 @@ def api_dispositivo_contenuto(dev_id):
                                 "ultimo_aggiornamento": now_iso()}
         else:
             dev["contenuto"] = None
-        sched_manual["d:" + dev_id] = True   # override dedicato manuale
+        if url or want_idle:
+            sched_manual["d:" + dev_id] = True   # override dedicato manuale
+        else:
+            # override rimosso: il device torna al feed di gruppo e il
+            # palinsesto puo' riprendere il controllo
+            sched_manual.pop("d:" + dev_id, None)
         sched_active.pop("d:" + dev_id, None)
     save_config()
     if url or want_idle:

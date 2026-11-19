@@ -165,14 +165,35 @@ function admin() {
       this.api('/api/gruppi', { nome: n })
         .then(j => this.showToast(j.ok ? 'Gruppo "' + n + '" creato' : (j.error || 'Errore'), !j.ok));
     },
+    schedOv(key) {
+      return (this.stato.sched_active || {})[key] || null;
+    },
+    gOnAir(g) {
+      // contenuto effettivamente in onda sul gruppo: overlay palinsesto,
+      // altrimenti il base persistito (g[1] = record del gruppo)
+      const ov = this.schedOv('g:' + g[0]);
+      if (ov) return { ...g[1], tipo: ov.tipo || 'url',
+                       contenuto_attivo: ov.url,
+                       mode: ov.mode || 'iframe', sched: true };
+      return g[1];
+    },
     effContent(d) {
       const own = d.contenuto || {};
       if (own.tipo === 'idle' || own.tipo === 'none')
         return { contenuto_attivo: '', tipo: 'idle', playlist: [] };
+      const od = this.schedOv('d:' + d.id);
+      if (od) return { contenuto_attivo: od.url, tipo: od.tipo || 'url',
+                       mode: od.mode || 'iframe', playlist: [], sched: true };
       if (own.url) return { contenuto_attivo: own.url, tipo: own.tipo || 'url',
                             mode: own.mode || 'iframe',
                             ultimo_aggiornamento: own.ultimo_aggiornamento, playlist: [] };
-      return this.stato.gruppi[d.gruppo] || { contenuto_attivo: '', tipo: 'idle', playlist: [] };
+      const og = this.schedOv('g:' + d.gruppo);
+      const g = this.stato.gruppi[d.gruppo]
+                || { contenuto_attivo: '', tipo: 'idle', playlist: [] };
+      if (og) return { ...g, tipo: og.tipo || 'url',
+                       contenuto_attivo: og.url,
+                       mode: og.mode || 'iframe', sched: true };
+      return g;
     },
     groupTvs(g) {
       let a = 0, o = 0;
@@ -762,6 +783,11 @@ function admin() {
                 <span x-show="d.contenuto && d.contenuto.url"
                   class="absolute top-2 right-2 bg-indigo-600/90 text-white
                          text-[10px] px-2 py-0.5 rounded-full">dedicato</span>
+                <span x-show="effContent(d).sched"
+                  class="absolute bottom-2 left-2 bg-violet-600/90 text-white
+                         text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1">
+                  <i data-lucide="calendar-clock" class="w-3 h-3"></i>palinsesto
+                </span>
                 <span x-show="d.contenuto && (d.contenuto.tipo==='idle' || d.contenuto.tipo==='none')"
                   class="absolute top-2 right-2 bg-amber-600/90 text-white
                          text-[10px] px-2 py-0.5 rounded-full">pairing</span>
@@ -854,30 +880,30 @@ function admin() {
             <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden
                         hover:border-slate-600 transition group">
 
-              <!-- preview 16:9 -->
+              <!-- preview 16:9 (overlay palinsesto se attivo, altrimenti base) -->
               <div class="relative aspect-video bg-black overflow-hidden">
-                <template x-if="g[1].tipo==='image'">
-                  <img :src="bust(g[1].contenuto_attivo, g[1].ultimo_aggiornamento)"
+                <template x-if="gOnAir(g).tipo==='image'">
+                  <img :src="bust(gOnAir(g).contenuto_attivo, gOnAir(g).ultimo_aggiornamento)"
                        class="w-full h-full object-cover" alt="">
                 </template>
-                <template x-if="g[1].tipo==='video'">
-                  <video :src="bust(g[1].contenuto_attivo, g[1].ultimo_aggiornamento)"
+                <template x-if="gOnAir(g).tipo==='video'">
+                  <video :src="bust(gOnAir(g).contenuto_attivo, gOnAir(g).ultimo_aggiornamento)"
                          muted playsinline preload="metadata"
                          class="w-full h-full object-cover"></video>
                 </template>
-                <template x-if="g[1].tipo==='youtube'">
+                <template x-if="gOnAir(g).tipo==='youtube'">
                   <div class="w-full h-full flex items-center justify-center">
-                    <img x-show="ytThumb(g[1].contenuto_attivo)"
-                         :src="ytThumb(g[1].contenuto_attivo)"
+                    <img x-show="ytThumb(gOnAir(g).contenuto_attivo)"
+                         :src="ytThumb(gOnAir(g).contenuto_attivo)"
                          class="absolute inset-0 w-full h-full object-cover" alt="" loading="lazy">
                     <i data-lucide="youtube" class="w-8 h-8 text-red-500"></i>
                   </div>
                 </template>
-                <template x-if="g[1].tipo==='url' && g[1].contenuto_attivo">
-                  <iframe :src="pvSrc(g[1].contenuto_attivo)"
+                <template x-if="gOnAir(g).tipo==='url' && gOnAir(g).contenuto_attivo">
+                  <iframe :src="pvSrc(gOnAir(g).contenuto_attivo)"
                           class="pv-frame" loading="lazy" tabindex="-1"></iframe>
                 </template>
-                <template x-if="!g[1].tipo || g[1].tipo==='idle'">
+                <template x-if="!gOnAir(g).tipo || gOnAir(g).tipo==='idle'">
                   <div class="w-full h-full flex flex-col items-center justify-center text-slate-700">
                     <i data-lucide="monitor" class="w-8 h-8"></i>
                     <span class="text-xs mt-2">In attesa di contenuti</span>
@@ -889,9 +915,14 @@ function admin() {
                          text-[10px] font-bold px-2 py-0.5 rounded-full">
                   <span class="w-1.5 h-1.5 bg-white rounded-full animate-pulse"></span>LIVE
                 </span>
-                <span x-show="g[1].tipo==='url' && g[1].mode"
+                <span x-show="gOnAir(g).tipo==='url' && gOnAir(g).mode"
                   class="absolute top-2 right-2 bg-slate-800/90 text-slate-300
-                         text-[10px] px-2 py-0.5 rounded-full" x-text="g[1].mode"></span>
+                         text-[10px] px-2 py-0.5 rounded-full" x-text="gOnAir(g).mode"></span>
+                <span x-show="schedOv('g:'+g[0])"
+                  class="absolute bottom-2 left-2 bg-violet-600/90 text-white
+                         text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1">
+                  <i data-lucide="calendar-clock" class="w-3 h-3"></i>palinsesto
+                </span>
                 <span x-show="g[1].playlist && g[1].playlist.length"
                   class="absolute bottom-2 right-2 bg-amber-600/90 text-white
                          text-[10px] px-2 py-0.5 rounded-full">
@@ -944,7 +975,7 @@ function admin() {
                 </div>
 
                 <div class="text-xs text-slate-500 truncate mt-1"
-                     x-text="g[1].contenuto_attivo || '(nessun contenuto)'"></div>
+                     x-text="gOnAir(g).contenuto_attivo || '(nessun contenuto)'"></div>
                 <div x-show="g[1].mode==='redirect' && !clients(g[0])"
                      class="text-[11px] text-red-400 mt-1">
                   ⚠ redirect attivo: controllo remoto sospeso
