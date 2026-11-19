@@ -1317,7 +1317,7 @@ function admin() {
                       class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5
                              text-sm focus:outline-none focus:border-indigo-500">
                       <option value="">— scegli app —</option>
-                      <template x-for="a in apps()" :key="'sca-'+a.id">
+                      <template x-for="a in savedApps" :key="'sca-'+a.id">
                         <option :value="a.id" x-text="a.nome"></option>
                       </template>
                     </select>
