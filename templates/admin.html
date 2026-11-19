@@ -877,11 +877,11 @@ function admin() {
 
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4">
           <template x-for="g in groups()" :key="g[0]">
-            <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden
+            <div class="bg-slate-900 border border-slate-800 rounded-xl
                         hover:border-slate-600 transition group">
 
               <!-- preview 16:9 (overlay palinsesto se attivo, altrimenti base) -->
-              <div class="relative aspect-video bg-black overflow-hidden">
+              <div class="relative aspect-video bg-black overflow-hidden rounded-t-xl">
                 <template x-if="gOnAir(g).tipo==='image'">
                   <img :src="bust(gOnAir(g).contenuto_attivo, gOnAir(g).ultimo_aggiornamento)"
                        class="w-full h-full object-cover" alt="">
