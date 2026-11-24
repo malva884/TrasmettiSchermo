@@ -386,6 +386,7 @@ function admin() {
         tbTitle: tipo === 'task_board' ? 'Piano Operativo Controllo Qualità' : '',
         tbSheetId: '', tbTimelineId: '', tbWebhook: '', tbServiceAccount: '',
         tbIdleUrl: '', tbIdleMin: '',
+        tbTestBusy: false, tbTestMain: '', tbTestTimeline: '',
         geoResults: [], geoBusy: false };
       if (app) {
         const p = app.params || {};
@@ -497,6 +498,29 @@ function admin() {
         this.showToast(j.ok ? 'App salvata' : (j.error || 'Errore'), !j.ok);
         if (j.ok) { this.appModal.open = false; }
       });
+    },
+    async testTbAccess() {
+      const m = this.appModal;
+      m.tbTestBusy = true; m.tbTestMain = ''; m.tbTestTimeline = '';
+      try {
+        const r = await fetch('/api/task_board/test_access', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            service_account: m.tbServiceAccount,
+            sheet_id: m.tbSheetId,
+            timeline_sheet_id: m.tbTimelineId })
+        });
+        const j = await r.json();
+        const fmt = (x) => x.ok
+          ? '✅ OK: ' + (x.title || 'accesso riuscito')
+          : '❌ ' + (x.error || 'errore');
+        if (!j.ok) { m.tbTestMain = '❌ ' + (j.error || 'errore generico'); }
+        else {
+          m.tbTestMain = fmt(j.results.main);
+          if (j.results.timeline) m.tbTestTimeline = fmt(j.results.timeline);
+        }
+      } catch (e) { m.tbTestMain = '❌ Errore di rete'; }
+      m.tbTestBusy = false;
     },
     delApp(id) {
       if (!confirm('Eliminare questa app?')) return;
@@ -1976,6 +2000,18 @@ function admin() {
           <input x-model="appModal.tbIdleMin" type="number" min="1" max="120" placeholder="10"
             class="w-24 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm
                    focus:outline-none focus:border-indigo-500">
+        </div>
+
+        <button @click="testTbAccess()" :disabled="appModal.tbTestBusy"
+          class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg text-xs mb-1
+                 disabled:opacity-50">
+          <span x-show="!appModal.tbTestBusy">Verifica accesso Sheet</span>
+          <span x-show="appModal.tbTestBusy">Verifica in corso...</span>
+        </button>
+        <div x-show="appModal.tbTestMain" class="text-[11px] text-slate-300 mb-3">
+          <div x-text="'Foglio principale → ' + appModal.tbTestMain"></div>
+          <div x-show="appModal.tbTestTimeline"
+               x-text="'Timeline → ' + appModal.tbTestTimeline"></div>
         </div>
       </div>
     </template>

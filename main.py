@@ -1357,6 +1357,53 @@ def api_task_board_dati(board_id):
     return jsonify({"ok": True, "data": data})
 
 
+def _check_sheet_access(sheet_id, creds):
+    """Prova la lettura dei metadata dello Sheet: verifica ID e permessi SA."""
+    sheet_id = (sheet_id or "").strip()
+    if not sheet_id:
+        return {"ok": False, "error": "ID foglio mancante"}
+    try:
+        if not creds.valid:
+            creds.refresh(_ga_request())
+        r = ext_requests.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            params={"fields": "properties.title"}, timeout=15)
+        if r.status_code == 200:
+            title = r.json().get("properties", {}).get("title", "")
+            return {"ok": True, "title": title}
+        if r.status_code == 404:
+            return {"ok": False, "error": "Foglio non trovato (ID errato)"}
+        if r.status_code in (401, 403):
+            return {"ok": False,
+                    "error": "Accesso negato: condividi il foglio con "
+                             "l'email del Service Account"}
+        return {"ok": False, "error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:150]}
+
+
+@app.route("/api/task_board/test_access", methods=["POST"])
+def api_task_board_test_access():
+    """Verifica che le credenziali SA (JSON o file) accedano ai fogli indicati.
+
+    Body JSON: {service_account, sheet_id, timeline_sheet_id}
+    Le credenziali vengono solo usate per il test, non salvate."""
+    body = request.get_json(silent=True) or {}
+    if not _GOOGLE_AUTH_OK:
+        return jsonify({"ok": False,
+                        "error": "google-auth non installato sul server"})
+    creds = _sa_credentials(body)
+    if not creds:
+        return jsonify({"ok": False,
+                        "error": "Credenziali assenti o JSON non valido"})
+    results = {"main": _check_sheet_access(body.get("sheet_id"), creds)}
+    if (body.get("timeline_sheet_id") or "").strip():
+        results["timeline"] = _check_sheet_access(
+            body.get("timeline_sheet_id"), creds)
+    return jsonify({"ok": True, "results": results})
+
+
 @app.route("/api/task_board/<board_id>/aggiorna", methods=["POST"])
 def api_task_board_aggiorna(board_id):
     req_data = request.get_json(force=True) or {}
@@ -1613,7 +1660,10 @@ def api_apps_save():
                  "created": (cfgs.get(app_id) or {}).get("created") or now_iso(),
                  "updated": now_iso()}
         if isinstance(params, dict):
-            entry["params"] = {str(k)[:40]: str(v)[:500]
+            # Limiti per-chiave: il JSON del Service Account supera i 500
+            # caratteri e verrebbe troncato/corrotto dal limite generico.
+            max_len = {"service_account": 20000}
+            entry["params"] = {str(k)[:40]: str(v)[:max_len.get(k, 500)]
                                for k, v in params.items()
                                if isinstance(v, (str, int, float, bool))}
         if tipo == "social":
