@@ -385,6 +385,7 @@ function admin() {
         ntStream: (this.stato.news_tv || {}).skytg24 || '',
         tbTitle: tipo === 'task_board' ? 'Piano Operativo Controllo Qualità' : '',
         tbSheetId: '', tbTimelineId: '', tbWebhook: '', tbServiceAccount: '',
+        tbIdleUrl: '', tbIdleMin: '',
         geoResults: [], geoBusy: false };
       if (app) {
         const p = app.params || {};
@@ -405,6 +406,8 @@ function admin() {
         this.appModal.tbTimelineId = p.timeline_sheet_id || '';
         this.appModal.tbWebhook = p.webhook_url || '';
         this.appModal.tbServiceAccount = p.service_account || '';
+        this.appModal.tbIdleUrl = p.idle_app_url || '';
+        this.appModal.tbIdleMin = p.idle_minutes || '';
         // audio: parametro params.audio oppure mute= nell'URL salvato
         // (default: muto)
         const am = (app.url || '').match(/[?&]mute=(0|1)/);
@@ -473,7 +476,8 @@ function admin() {
                   channel: m.ntChannel, audio: m.ntAudio ? 'on' : 'off',
                   stream: m.ntStream,
                   sheet_id: m.tbSheetId, timeline_sheet_id: m.tbTimelineId,
-                  webhook_url: m.tbWebhook, service_account: m.tbServiceAccount } };
+                  webhook_url: m.tbWebhook, service_account: m.tbServiceAccount,
+                  idle_app_url: m.tbIdleUrl, idle_minutes: m.tbIdleMin } };
       if (m.id) body.id = m.id;
       if (m.tipo === 'social') {
         if (!m.html_snippet.trim()) {
@@ -1956,6 +1960,22 @@ function admin() {
           <code class="text-indigo-300">data/</code>. Richiede <b>Google Sheets API</b> abilitata e il foglio
           condiviso con l'email del service account (Editor per salvare stato/note sul foglio).
           Se configurato, il server legge e scrive sullo Sheet anche senza condivisione pubblica e senza webhook.
+        </div>
+
+        <label class="block text-xs text-slate-400 mb-1">App mostrata dopo inattività (opzionale)</label>
+        <input x-model="appModal.tbIdleUrl" type="text"
+          placeholder="/apps/clock?theme=dark oppure URL completo"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono mb-1
+                 focus:outline-none focus:border-indigo-500">
+        <div class="text-[11px] text-slate-500 mb-2">
+          Al posto dello screensaver con orologio, dopo i minuti di inattività viene mostrata
+          questa app/widget a tutto schermo. Toccando lo schermo si torna alla lavagna.
+        </div>
+        <div class="flex items-center gap-2 mb-3">
+          <label class="text-xs text-slate-400 whitespace-nowrap">Minuti di inattività</label>
+          <input x-model="appModal.tbIdleMin" type="number" min="1" max="120" placeholder="10"
+            class="w-24 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm
+                   focus:outline-none focus:border-indigo-500">
         </div>
       </div>
     </template>

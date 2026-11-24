@@ -1339,8 +1339,16 @@ def app_task_board(board_id="default"):
     params = cfg.get("params") or {}
     titolo = (params.get("title") or cfg.get("nome")
               or "Piano Operativo Controllo Qualità")
-    return render_template("apps/task_board.html", board_id=board_id,
-                           titolo=titolo, nome=cfg.get("nome", board_id))
+    try:
+        idle_minutes = int(params.get("idle_minutes") or 10)
+    except (TypeError, ValueError):
+        idle_minutes = 10
+    idle_minutes = max(1, min(120, idle_minutes))
+    return render_template(
+        "apps/task_board.html", board_id=board_id,
+        titolo=titolo, nome=cfg.get("nome", board_id),
+        idle_url=(params.get("idle_app_url") or "").strip(),
+        idle_minutes=idle_minutes)
 
 
 @app.route("/api/task_board/<board_id>/dati")

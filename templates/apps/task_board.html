@@ -1113,6 +1113,13 @@
     <div class="ss-digital-date" id="ssDigitalDate">--</div>
     <div class="ss-status-pill" id="ssTaskSummary">{{ titolo or nome or 'Piano Operativo' }}</div>
     <div class="ss-hint">👆 Tocca un punto qualsiasi dello schermo per tornare alla lavagna</div>
+    <!-- App/widget alternativa mostrata durante l'inattività (configurata da admin).
+         Il layer trasparente sopra l'iframe intercetta il tocco e chiude lo screensaver. -->
+    <div id="ssAppWrap" style="display:none; position:absolute; top:0; left:0; right:0; bottom:0; background:#000;">
+      <iframe id="ssAppFrame" src="about:blank" style="width:100%; height:100%; border:0;"></iframe>
+      <div style="position:absolute; top:0; left:0; right:0; bottom:0; cursor:pointer;"
+           title="Tocca per tornare alla lavagna"></div>
+    </div>
   </div>
 
   <script>
@@ -1133,6 +1140,7 @@
     }
 
     const BOARD_ID = {{ board_id|tojson }};
+    const IDLE_APP_URL = {{ idle_url|tojson }};
     let appData = { tasks: [], collaboratori: [], kpis: [] };
     let vistaAttuale = 'settimana';
     let dataRiferimento = new Date();
@@ -1147,7 +1155,8 @@
     let idleResetTimeout = null;
     let screensaverTimeout = null;
 
-    const TEMPO_SCREENSAVER_MS = 10 * 60 * 1000; // 10 minuti di inattività
+    // Minuti di inattività prima dello screensaver (configurabili da admin)
+    const TEMPO_SCREENSAVER_MS = {{ idle_minutes or 10 }} * 60 * 1000;
 
     // Gestione tema notte automatico dalle 17:00
     let overrideTemaManuale = null;
@@ -1302,6 +1311,16 @@
       document.getElementById('ssTaskSummary').innerText =
         `📋 ${taskOggi.length} task operativ${taskOggi.length === 1 ? 'o' : 'i'} in programma oggi`;
 
+      // Se configurata, al posto dell'orologio mostra l'app/widget scelta da admin
+      if (IDLE_APP_URL) {
+        const wrap = document.getElementById('ssAppWrap');
+        const frame = document.getElementById('ssAppFrame');
+        if (wrap && frame) {
+          frame.src = IDLE_APP_URL; // ricarica fresca a ogni attivazione
+          wrap.style.display = 'block';
+        }
+      }
+
       ss.style.display = 'flex';
     }
 
@@ -1309,6 +1328,13 @@
       if (e) e.stopPropagation();
       const ss = document.getElementById('screensaverOverlay');
       if (ss) ss.style.display = 'none';
+      // Scarica l'app di cortesia per liberare memoria e fermare audio/video
+      const wrap = document.getElementById('ssAppWrap');
+      if (wrap) {
+        wrap.style.display = 'none';
+        const frame = document.getElementById('ssAppFrame');
+        if (frame) frame.src = 'about:blank';
+      }
       resetIdleKioskTimer();
     }
 
