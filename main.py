@@ -27,6 +27,16 @@ except Exception:
     print("WARN: tzdata non disponibile, palinsesto valutato in UTC. "
           "Installare il pacchetto 'tzdata' o impostare TZ.")
 
+try:
+    # Accesso autenticato a Google Sheets via Service Account (task board)
+    from google.oauth2 import service_account as _sa_module
+    from google.auth.transport.requests import Request as _ga_request
+    _GOOGLE_AUTH_OK = True
+except Exception:
+    _sa_module = None
+    _ga_request = None
+    _GOOGLE_AUTH_OK = False
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Percorsi persistenti configurabili via env (volumi Coolify/Docker).
@@ -922,6 +932,556 @@ def app_news_tv():
         hls_src=stream if is_hls else None)
 
 
+# ---------------------------------------------------------------------------
+# App: Lavagna Task & KPI Touch (Google Sheets / Webhook / Locale)
+# ---------------------------------------------------------------------------
+TASK_BOARDS_DIR = os.path.join(DATA_DIR, "task_boards")
+
+DEFAULT_TASK_BOARD_DATA = {
+    "tasks": [
+        {
+            "ID": "TSK-001",
+            "Data": "",
+            "Collaboratore": "Mario Rossi",
+            "Titolo": "Controllo Qualità Lotto A",
+            "Descrizione": "Verifica campionaria tolleranze e spessori",
+            "Stato": "In corso",
+            "Priorita": "Alta",
+            "Note": "Avviato controllo primi 5 campioni",
+        },
+        {
+            "ID": "TSK-002",
+            "Data": "",
+            "Collaboratore": "Luca Bianchi",
+            "Titolo": "Taratura Strumenti Linea 2",
+            "Descrizione": "Calibrazione calibri digitali e micrometri",
+            "Stato": "Da fare",
+            "Priorita": "Normale",
+            "Note": "",
+        },
+        {
+            "ID": "TSK-003",
+            "Data": "",
+            "Collaboratore": "Mario Rossi",
+            "Titolo": "Verifica Certificati Materie Prime",
+            "Descrizione": "Controllo conformità schede tecniche fornitore",
+            "Stato": "Completato",
+            "Priorita": "Normale",
+            "Note": "Conforme",
+        },
+    ],
+    "collaboratori": [
+        {
+            "Nome": "Mario Rossi",
+            "PIN": "1234",
+            "Ruolo": "Responsabile",
+            "Email": "mario.rossi@example.com",
+        },
+        {
+            "Nome": "Luca Bianchi",
+            "PIN": "0000",
+            "Ruolo": "Operatore",
+            "Email": "luca.bianchi@example.com",
+        },
+    ],
+    "kpis": [
+        {
+            "Collaboratore": "Mario Rossi",
+            "Obiettivo": "Audit Conformità",
+            "Target": "100%",
+            "Attuale": "85%",
+        },
+        {
+            "Collaboratore": "Luca Bianchi",
+            "Obiettivo": "Lotti Verificati",
+            "Target": "50",
+            "Attuale": "42",
+        },
+    ],
+}
+
+
+def _parse_gviz_sheet(sheet_id, sheet_name):
+    """Legge una scheda di un Google Spreadsheet via endpoint GViz pubblico/condiviso."""
+    url = (f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
+           f"?tqx=out:json&sheet={quote(sheet_name)}")
+    try:
+        r = ext_requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return []
+        m = re.search(r"setResponse\((.*)\);", r.text, re.DOTALL)
+        if not m:
+            return []
+        raw = json.loads(m.group(1))
+        table = raw.get("table", {})
+        cols = [str(c.get("label") or "").strip() for c in table.get("cols", [])]
+        rows = []
+        for r_entry in table.get("rows", []):
+            cells = r_entry.get("c") or []
+            row_obj = {}
+            has_val = False
+            for i, cell in enumerate(cells):
+                val = ""
+                if cell:
+                    val = cell.get("f") if cell.get("f") is not None else cell.get("v")
+                    val = "" if val is None else str(val).strip()
+                if val:
+                    has_val = True
+                col_name = cols[i] if i < len(cols) and cols[i] else f"_col{i}"
+                row_obj[col_name] = val
+                row_obj[f"_col{i}"] = val
+            if has_val:
+                rows.append(row_obj)
+        return rows
+    except Exception as e:
+        print(f"WARN: _parse_gviz_sheet({sheet_id}, {sheet_name}) errore: {e}")
+        return []
+
+
+# --- Google Sheets API v4 con Service Account (lettura/scrittura) ---
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+_sa_creds_cache = {}
+
+
+def _sa_credentials(params):
+    """Credenziali Service Account dal parametro 'service_account':
+    accetta il JSON incollato oppure un percorso file (assoluto o
+    relativo a DATA_DIR, es. 'sa.json')."""
+    raw = (params.get("service_account") or "").strip()
+    if not raw:
+        return None
+    if not _GOOGLE_AUTH_OK:
+        print("WARN: google-auth non installato, Service Account non disponibile")
+        return None
+    creds = _sa_creds_cache.get(raw)
+    if creds is None:
+        try:
+            if raw.startswith("{"):
+                creds = _sa_module.Credentials.from_service_account_info(
+                    json.loads(raw), scopes=GOOGLE_SHEETS_SCOPES)
+            else:
+                path = raw if os.path.isabs(raw) else os.path.join(DATA_DIR, raw)
+                creds = _sa_module.Credentials.from_service_account_file(
+                    path, scopes=GOOGLE_SHEETS_SCOPES)
+        except Exception as e:
+            print(f"WARN: credenziali Service Account non valide: {e}")
+            return None
+        _sa_creds_cache[raw] = creds
+    return creds
+
+
+def _sheets_api_request(method, sheet_id, path, creds, body=None,
+                        params_qs=None):
+    """Chiamata REST a Sheets API v4 con token OAuth2 del Service Account."""
+    if not creds.valid:
+        creds.refresh(_ga_request())
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}{path}"
+    r = ext_requests.request(method, url, json=body, params=params_qs,
+                             headers={"Authorization": f"Bearer {creds.token}"},
+                             timeout=12)
+    if r.status_code != 200:
+        print(f"WARN: Sheets API {method} {path} -> {r.status_code}: "
+              f"{r.text[:300]}")
+        return None
+    return r.json()
+
+
+def _values_to_objects(values):
+    """Converte la matrice 'values' dell'API in (header, [oggetti riga]).
+    Ogni oggetto espone i valori per nome colonna, come _colN e il numero
+    di riga foglio in _row (utile per la scrittura)."""
+    if not values:
+        return [], []
+    header = [str(h or "").strip() for h in values[0]]
+    rows = []
+    for r_idx, row in enumerate(values[1:], start=2):
+        obj = {"_row": r_idx}
+        has_val = False
+        for i in range(len(header)):
+            val = ""
+            if i < len(row) and row[i] is not None:
+                val = str(row[i]).strip()
+            if val:
+                has_val = True
+            h = header[i]
+            if h:
+                obj[h] = val
+            obj[f"_col{i}"] = val
+        if has_val:
+            rows.append(obj)
+    return header, rows
+
+
+def _sheet_rows_via_api(sheet_id, sheet_name, creds):
+    j = _sheets_api_request("GET", sheet_id,
+                            f"/values/{quote(sheet_name, safe='')}", creds)
+    if j is None:
+        return []
+    _, rows = _values_to_objects(j.get("values") or [])
+    return rows
+
+
+def _col_letter(idx):
+    """Indice colonna 0-based -> notazione A1 (0->A, 9->J, ...)."""
+    s = ""
+    idx += 1
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _normalize_board_objects(raw_tasks, raw_collab, raw_kpi):
+    """Normalizza le righe grezze (GViz o Sheets API) nel formato lavagna."""
+    if not (raw_tasks or raw_collab or raw_kpi):
+        return None
+    tasks = []
+    for t in raw_tasks:
+        titolo = t.get("Titolo") or t.get("_col3") or ""
+        if not str(titolo).strip():
+            continue
+        tasks.append({
+            "ID": t.get("ID") or t.get("_col0") or "",
+            "Data": t.get("Data") or t.get("_col1") or "",
+            "Collaboratore": (t.get("Collaboratore")
+                              or t.get("_col2") or ""),
+            "Titolo": titolo,
+            "Descrizione": (t.get("Descrizione")
+                            or t.get("_col4") or ""),
+            "Stato": t.get("Stato") or t.get("_col5") or "Da fare",
+            "Priorita": (t.get("Priorità") or t.get("Priorita")
+                         or t.get("_col6") or "Normale"),
+            "Note": t.get("Note") or t.get("_col7") or "",
+        })
+    collabs = []
+    for c in raw_collab:
+        nome = c.get("Nome") or c.get("_col0") or ""
+        if not str(nome).strip():
+            continue
+        collabs.append({
+            "Nome": nome,
+            "PIN": c.get("PIN") or c.get("_col1") or "0000",
+            "Ruolo": (c.get("Ruolo")
+                      or c.get("_col2") or "Collaboratore"),
+            "Email": c.get("Email") or c.get("_col3") or "",
+        })
+    kpis = []
+    for k in raw_kpi:
+        obiettivo = k.get("Obiettivo") or k.get("_col1") or ""
+        if not str(obiettivo).strip():
+            continue
+        kpis.append({
+            "Collaboratore": (k.get("Collaboratore")
+                              or k.get("_col0") or ""),
+            "Obiettivo": obiettivo,
+            "Target": k.get("Target") or k.get("_col2") or "100%",
+            "Attuale": k.get("Attuale") or k.get("_col3") or "0%",
+        })
+    return {"tasks": tasks, "collaboratori": collabs, "kpis": kpis}
+
+
+def write_task_to_sheet(sheet_id, task_id, nuovo_stato, note, creds):
+    """Aggiorna Stato/Note della riga del task nel tab 'Task' via Sheets API."""
+    j = _sheets_api_request("GET", sheet_id,
+                            f"/values/{quote('Task', safe='')}", creds)
+    if j is None:
+        return False
+    header, rows = _values_to_objects(j.get("values") or [])
+    row_no = None
+    for obj in rows:
+        if str(obj.get("ID") or obj.get("_col0") or "").strip() == task_id:
+            row_no = obj["_row"]
+            break
+    if not row_no:
+        print(f"WARN: task {task_id} non trovato nel tab Task")
+        return False
+    hdr = {name: i for i, name in enumerate(header)}
+    si = hdr.get("Stato", 5)
+    ni = hdr.get("Note", 7)
+    updates = []
+    if nuovo_stato:
+        updates.append({"range": f"Task!{_col_letter(si)}{row_no}",
+                        "values": [[nuovo_stato]]})
+    updates.append({"range": f"Task!{_col_letter(ni)}{row_no}",
+                    "values": [[note]]})
+    res = _sheets_api_request(
+        "POST", sheet_id, "/values:batchUpdate", creds,
+        body={"valueInputOption": "USER_ENTERED", "data": updates})
+    return res is not None
+
+
+def append_task_to_sheet(sheet_id, task, creds):
+    """Accoda una riga nel tab 'Task' allineata all'header esistente."""
+    j = _sheets_api_request("GET", sheet_id,
+                            f"/values/{quote('Task!1:1', safe='')}", creds)
+    header = []
+    if j and j.get("values"):
+        header = [str(h or "").strip() for h in j["values"][0]]
+    if header:
+        row = []
+        for h in header:
+            if h in ("Priorita", "Priorità"):
+                row.append(task.get("Priorita", "") or "")
+            else:
+                row.append(task.get(h, "") or "")
+    else:
+        row = [task.get("ID", ""), task.get("Data", ""),
+               task.get("Collaboratore", ""), task.get("Titolo", ""),
+               task.get("Descrizione", ""), task.get("Stato", ""),
+               task.get("Priorita", ""), task.get("Note", "")]
+    res = _sheets_api_request(
+        "POST", sheet_id,
+        f"/values/{quote('Task', safe='')}:append", creds,
+        body={"values": [row]},
+        params_qs={"valueInputOption": "USER_ENTERED",
+                   "insertDataOption": "INSERT_ROWS"})
+    return res is not None
+
+
+def mark_timeline_done(sheet_id, task_id, creds):
+    """Replica segnaCompletatoSuTimeline: cerca l'ID in 'Schedulation'
+    e scrive 'OK' nella colonna J della riga trovata."""
+    j = _sheets_api_request("GET", sheet_id,
+                            f"/values/{quote('Schedulation', safe='')}", creds)
+    if j is None:
+        return False
+    values = j.get("values") or []
+    for i, row in enumerate(values[1:], start=2):
+        if any(str(c or "").strip() == task_id for c in row):
+            res = _sheets_api_request(
+                "POST", sheet_id, "/values:batchUpdate", creds,
+                body={"valueInputOption": "USER_ENTERED",
+                      "data": [{"range": f"Schedulation!J{i}",
+                                "values": [["OK"]]}]})
+            return res is not None
+    print(f"WARN: task {task_id} non trovato in Schedulation")
+    return False
+
+
+def sync_task_board_from_remote(board_id, params):
+    webhook = (params.get("webhook_url") or "").strip()
+    sheet_id = (params.get("sheet_id") or "").strip()
+    if webhook:
+        try:
+            r = ext_requests.get(webhook, timeout=10)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, dict):
+                    d = j.get("data") if "data" in j else j
+                    if isinstance(d, dict) and "tasks" in d:
+                        return d
+        except Exception as e:
+            print(f"WARN: errore fetch webhook task board {board_id}: {e}")
+    if sheet_id:
+        # 1) Sheets API autenticata con Service Account (se configurato)
+        creds = _sa_credentials(params)
+        if creds:
+            try:
+                data = _normalize_board_objects(
+                    _sheet_rows_via_api(sheet_id, "Task", creds),
+                    _sheet_rows_via_api(sheet_id, "Collaboratori", creds),
+                    _sheet_rows_via_api(sheet_id, "KPI", creds))
+                if data:
+                    return data
+            except Exception as e:
+                print(f"WARN: errore sync Sheets API {sheet_id}: {e}")
+        # 2) Fallback GViz: funziona solo se il foglio e' condiviso col link
+        try:
+            data = _normalize_board_objects(
+                _parse_gviz_sheet(sheet_id, "Task"),
+                _parse_gviz_sheet(sheet_id, "Collaboratori"),
+                _parse_gviz_sheet(sheet_id, "KPI"))
+            if data:
+                return data
+        except Exception as e:
+            print(f"WARN: errore sync google sheet {sheet_id}: {e}")
+    return None
+
+
+def get_task_board_data(board_id):
+    os.makedirs(TASK_BOARDS_DIR, exist_ok=True)
+    fp = os.path.join(TASK_BOARDS_DIR, f"{secure_filename(board_id)}.json")
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"WARN: errore lettura task board {board_id}: {e}")
+    with state_lock:
+        cfg = (state.get("app_configs") or {}).get(board_id) or {}
+    params = cfg.get("params") or {}
+    data = sync_task_board_from_remote(board_id, params)
+    if data:
+        save_task_board_data(board_id, data)
+        return data
+    demo = json.loads(json.dumps(DEFAULT_TASK_BOARD_DATA))
+    oggi_str = datetime.now(LOCAL_TZ).strftime("%d/%m/%Y")
+    for t in demo["tasks"]:
+        t["Data"] = oggi_str
+    save_task_board_data(board_id, demo)
+    return demo
+
+
+def save_task_board_data(board_id, data):
+    os.makedirs(TASK_BOARDS_DIR, exist_ok=True)
+    fp = os.path.join(TASK_BOARDS_DIR, f"{secure_filename(board_id)}.json")
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, fp)
+
+
+@app.route("/apps/task_board/<board_id>")
+@app.route("/apps/task_board")
+def app_task_board(board_id="default"):
+    with state_lock:
+        cfg = (state.get("app_configs") or {}).get(board_id) or {}
+    params = cfg.get("params") or {}
+    titolo = (params.get("title") or cfg.get("nome")
+              or "Piano Operativo Controllo Qualità")
+    return render_template("apps/task_board.html", board_id=board_id,
+                           titolo=titolo, nome=cfg.get("nome", board_id))
+
+
+@app.route("/api/task_board/<board_id>/dati")
+def api_task_board_dati(board_id):
+    data = get_task_board_data(board_id)
+    return jsonify({"ok": True, "data": data})
+
+
+@app.route("/api/task_board/<board_id>/aggiorna", methods=["POST"])
+def api_task_board_aggiorna(board_id):
+    req_data = request.get_json(force=True) or {}
+    task_id = str(req_data.get("id") or "").strip()
+    nuovo_stato = str(req_data.get("nuovoStato") or "").strip()
+    note = str(req_data.get("note") or "").strip()
+    if not task_id:
+        return jsonify({"ok": False, "error": "ID task mancante"}), 400
+
+    board_data = get_task_board_data(board_id)
+    found = False
+    target_task = None
+    for t in board_data.get("tasks", []):
+        if str(t.get("ID") or "").strip() == task_id:
+            t["Stato"] = nuovo_stato
+            t["Note"] = note
+            t["UltimoAggiornamento"] = datetime.now(LOCAL_TZ).isoformat()
+            found = True
+            target_task = t
+            break
+
+    if not found:
+        return jsonify({"ok": False, "error": "Task non trovato"}), 404
+
+    save_task_board_data(board_id, board_data)
+
+    with state_lock:
+        cfg = (state.get("app_configs") or {}).get(board_id) or {}
+    params = cfg.get("params") or {}
+    webhook = (params.get("webhook_url") or "").strip()
+    if webhook:
+        try:
+            ext_requests.post(webhook, json={
+                "action": "aggiornaTask",
+                "id": task_id,
+                "nuovoStato": nuovo_stato,
+                "nuoveNote": note,
+                "task": target_task,
+                "timeline_sheet_id": params.get("timeline_sheet_id", "")
+            }, timeout=8)
+        except Exception as e:
+            print(f"WARN: webhook aggiornaTask fallito: {e}")
+
+    # Scrittura diretta su Google Sheet via Service Account
+    creds = _sa_credentials(params)
+    sheet_id = (params.get("sheet_id") or "").strip()
+    if creds and sheet_id:
+        try:
+            write_task_to_sheet(sheet_id, task_id, nuovo_stato, note, creds)
+            tl_id = (params.get("timeline_sheet_id") or "").strip()
+            if tl_id and nuovo_stato.strip().lower() == "completato":
+                mark_timeline_done(tl_id, task_id, creds)
+        except Exception as e:
+            print(f"WARN: scrittura Sheets API (aggiorna) fallita: {e}")
+
+    return jsonify({"ok": True, "success": True})
+
+
+@app.route("/api/task_board/<board_id>/crea", methods=["POST"])
+def api_task_board_crea(board_id):
+    req_data = request.get_json(force=True) or {}
+    titolo = str(req_data.get("titolo") or "").strip()
+    if not titolo:
+        return jsonify({"ok": False, "error": "Titolo obbligatorio"}), 400
+
+    board_data = get_task_board_data(board_id)
+    tasks = board_data.setdefault("tasks", [])
+
+    max_id = 0
+    for t in tasks:
+        m = re.search(r"(\d+)", str(t.get("ID") or ""))
+        if m:
+            val = int(m.group(1))
+            if val > max_id:
+                max_id = val
+
+    nuovo_id = f"TSK-{max_id + 1:03d}"
+    data_str = (str(req_data.get("data") or "").strip()
+                or datetime.now(LOCAL_TZ).strftime("%d/%m/%Y"))
+
+    new_task = {
+        "ID": nuovo_id,
+        "Data": data_str,
+        "Collaboratore": str(req_data.get("collaboratore") or "").strip(),
+        "Titolo": titolo,
+        "Descrizione": str(req_data.get("descrizione") or "").strip(),
+        "Stato": "Da fare",
+        "Priorita": str(req_data.get("priorita") or "Normale").strip(),
+        "Note": "",
+        "Creato": datetime.now(LOCAL_TZ).isoformat()
+    }
+    tasks.insert(0, new_task)
+    save_task_board_data(board_id, board_data)
+
+    with state_lock:
+        cfg = (state.get("app_configs") or {}).get(board_id) or {}
+    params = cfg.get("params") or {}
+    webhook = (params.get("webhook_url") or "").strip()
+    if webhook:
+        try:
+            ext_requests.post(webhook, json={
+                "action": "creaNuovoTask",
+                "task": new_task
+            }, timeout=8)
+        except Exception as e:
+            print(f"WARN: webhook creaNuovoTask fallito: {e}")
+
+    # Scrittura diretta su Google Sheet via Service Account
+    creds = _sa_credentials(params)
+    sheet_id = (params.get("sheet_id") or "").strip()
+    if creds and sheet_id:
+        try:
+            append_task_to_sheet(sheet_id, new_task, creds)
+        except Exception as e:
+            print(f"WARN: scrittura Sheets API (crea) fallita: {e}")
+
+    return jsonify({"ok": True, "success": True, "task": new_task})
+
+
+@app.route("/api/task_board/<board_id>/sync", methods=["POST"])
+@requires_auth
+def api_task_board_sync(board_id):
+    with state_lock:
+        cfg = (state.get("app_configs") or {}).get(board_id) or {}
+    params = cfg.get("params") or {}
+    remote_data = sync_task_board_from_remote(board_id, params)
+    if remote_data:
+        save_task_board_data(board_id, remote_data)
+        return jsonify({"ok": True, "data": remote_data})
+    return jsonify({"ok": False,
+                    "error": "Impossibile sincronizzare dai server remoti"}), 502
+
+
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_TTL = 1800  # cache server-side 30 min: 1 chiamata esterna / 30 min
@@ -992,7 +1552,7 @@ def api_apps_geocode():
     return jsonify({"ok": True, "results": results})
 
 
-APP_TYPES = {"clock", "weather", "traffic", "social", "split", "news_tv"}
+APP_TYPES = {"clock", "weather", "traffic", "social", "split", "news_tv", "task_board"}
 
 
 @app.route("/api/apps/news_tv", methods=["POST"])
@@ -1051,6 +1611,8 @@ def api_apps_save():
         if tipo == "social":
             entry["html_snippet"] = str(data.get("html_snippet") or "")[:20000]
             entry["url"] = f"/apps/social/{app_id}"
+        elif tipo == "task_board":
+            entry["url"] = f"/apps/task_board/{app_id}"
         cfgs[app_id] = entry
     save_config()
     broadcast_stato()

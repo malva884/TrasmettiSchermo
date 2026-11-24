@@ -49,11 +49,14 @@ function admin() {
         desc: 'Sky TG24 o Rai News 24 a schermo intero, con badge LIVE.' },
       { tipo: 'split',   nome: 'Split-Screen',        icon: 'columns-2',
         desc: 'Contenuto principale 75% + barra laterale con widget.' },
+      { tipo: 'task_board', nome: 'Lavagna Task & KPI', icon: 'clipboard-list',
+        desc: 'Dashboard touch operativa: task, orologio, collaboratori, PIN e Google Sheets.' },
     ],
     appModal: { open: false, tipo: '', id: '', nome: '', title: '', theme: 'dark',
                 show_seconds: true, city: '', lat: '', lon: '', zoom: 13,
                 main: '', side: '', html_snippet: '',
                 ntChannel: 'skytg24', ntAudio: false, ntStream: '',
+                tbTitle: '', tbSheetId: '', tbTimelineId: '', tbWebhook: '',
                 geoResults: [], geoBusy: false },
 
     init() {
@@ -380,6 +383,8 @@ function admin() {
         main: '', side: '', html_snippet: '',
         ntChannel: 'skytg24', ntAudio: false,
         ntStream: (this.stato.news_tv || {}).skytg24 || '',
+        tbTitle: tipo === 'task_board' ? 'Piano Operativo Controllo Qualità' : '',
+        tbSheetId: '', tbTimelineId: '', tbWebhook: '', tbServiceAccount: '',
         geoResults: [], geoBusy: false };
       if (app) {
         const p = app.params || {};
@@ -395,6 +400,11 @@ function admin() {
         this.appModal.main = p.main || '';
         this.appModal.side = p.side || '';
         this.appModal.ntChannel = p.channel || 'skytg24';
+        this.appModal.tbTitle = p.title || app.nome || '';
+        this.appModal.tbSheetId = p.sheet_id || '';
+        this.appModal.tbTimelineId = p.timeline_sheet_id || '';
+        this.appModal.tbWebhook = p.webhook_url || '';
+        this.appModal.tbServiceAccount = p.service_account || '';
         // audio: parametro params.audio oppure mute= nell'URL salvato
         // (default: muto)
         const am = (app.url || '').match(/[?&]mute=(0|1)/);
@@ -428,11 +438,13 @@ function admin() {
       if (m.tipo === 'split')
         return '/apps/split?main=' + e(m.main) +
                (m.side ? '&side=' + e(m.side) : '');
+      if (m.tipo === 'task_board')
+        return m.id ? '/apps/task_board/' + m.id : '/apps/task_board';
       return '';
     },
     geocodeCity() {
       const city = (this.appModal.city || '').trim();
-      if (!city) { this.showToast('Inserisci una citt\u00e0', true); return; }
+      if (!city) { this.showToast('Inserisci una città', true); return; }
       this.appModal.geoBusy = true;
       fetch('/api/apps/geocode?city=' + encodeURIComponent(city))
         .then(r => r.json())
@@ -453,13 +465,15 @@ function admin() {
     saveApp() {
       const m = this.appModal;
       const body = { tipo: m.tipo,
-        nome: m.nome || m.title || m.city || this.appTypeName(m.tipo),
+        nome: m.nome || m.tbTitle || m.title || m.city || this.appTypeName(m.tipo),
         url: m.tipo === 'social' ? '' : this.appUrl(),
-        params: { title: m.title, theme: m.theme, show_seconds: m.show_seconds,
+        params: { title: m.tipo === 'task_board' ? m.tbTitle : m.title, theme: m.theme, show_seconds: m.show_seconds,
                   city: m.city, lat: m.lat, lon: m.lon, zoom: m.zoom,
                   main: m.main, side: m.side,
                   channel: m.ntChannel, audio: m.ntAudio ? 'on' : 'off',
-                  stream: m.ntStream } };
+                  stream: m.ntStream,
+                  sheet_id: m.tbSheetId, timeline_sheet_id: m.tbTimelineId,
+                  webhook_url: m.tbWebhook, service_account: m.tbServiceAccount } };
       if (m.id) body.id = m.id;
       if (m.tipo === 'social') {
         if (!m.html_snippet.trim()) {
@@ -1899,6 +1913,49 @@ function admin() {
         </datalist>
         <div class="text-[11px] text-slate-500 mb-3">
           Lascia vuoto per usare l'intero schermo per l'area principale.
+        </div>
+      </div>
+    </template>
+
+    <!-- campi: LAVAGNA TASK & KPI TOUCH -->
+    <template x-if="appModal.tipo==='task_board'">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Titolo Intestazione Dashboard</label>
+        <input x-model="appModal.tbTitle" type="text" placeholder="Es. Piano Operativo Controllo Qualità"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm mb-3
+                 focus:outline-none focus:border-indigo-500">
+
+        <label class="block text-xs text-slate-400 mb-1">ID Google Sheet Principale (Task, Collaboratori, KPI)</label>
+        <input x-model="appModal.tbSheetId" type="text" placeholder="Es. 1Ggg0qby4JmqawL9DV_KIspK-acl6vJEGRzyUb8q_LjU"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono mb-1
+                 focus:outline-none focus:border-indigo-500">
+        <div class="text-[11px] text-slate-500 mb-3">
+          ID del foglio di calcolo. Se vuoto, la lavagna usa l'archivio locale del server (con dati iniziali demo).
+        </div>
+
+        <label class="block text-xs text-slate-400 mb-1">ID Google Sheet Timeline / Schedulazione (opzionale)</label>
+        <input x-model="appModal.tbTimelineId" type="text" placeholder="ID foglio per END TEST = OK"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono mb-3
+                 focus:outline-none focus:border-indigo-500">
+
+        <label class="block text-xs text-slate-400 mb-1">URL Webhook Google Apps Script (opzionale)</label>
+        <input x-model="appModal.tbWebhook" type="text" placeholder="https://script.google.com/macros/s/.../exec"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono mb-1
+                 focus:outline-none focus:border-indigo-500">
+        <div class="text-[11px] text-slate-500 mb-3">
+          Se presente, il server inoltrerà in tempo reale i task creati o aggiornati al tuo script Google.
+        </div>
+
+        <label class="block text-xs text-slate-400 mb-1">Credenziali Service Account Google (opzionale)</label>
+        <textarea x-model="appModal.tbServiceAccount" rows="3" spellcheck="false"
+          placeholder='{"type":"service_account","project_id":"...","private_key":"..."}  oppure: nome-file.json in data/'
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono mb-1
+                 focus:outline-none focus:border-indigo-500"></textarea>
+        <div class="text-[11px] text-slate-500 mb-3">
+          Incolla il JSON della chiave del service account oppure indica il nome del file salvato in
+          <code class="text-indigo-300">data/</code>. Richiede <b>Google Sheets API</b> abilitata e il foglio
+          condiviso con l'email del service account (Editor per salvare stato/note sul foglio).
+          Se configurato, il server legge e scrive sullo Sheet anche senza condivisione pubblica e senza webhook.
         </div>
       </div>
     </template>
