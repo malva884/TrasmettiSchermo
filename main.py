@@ -14,7 +14,8 @@ import requests as ext_requests
 from flask import (Flask, Response, abort, jsonify, make_response,
                    render_template, request, send_from_directory)
 from flask_socketio import SocketIO, join_room, leave_room
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urljoin
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 try:
@@ -72,6 +73,11 @@ DEFAULT_CONTENT_URL = os.environ.get("DEFAULT_CONTENT_URL", "")
 app = Flask(__name__)
 app.jinja_env.auto_reload = True  # template modificati serviti subito
 app.config["MAX_CONTENT_LENGTH"] = 250 * 1024 * 1024  # 250 MB max upload
+# dietro reverse proxy (Coolify/Traefik): request.scheme e host_url
+# riflettono lo schema esterno HTTPS -> gli URL assoluti generati dal
+# /proxy non producono Mixed Content sul player servito in HTTPS
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1,
+                        x_prefix=1)
 
 # async_mode: gevent in produzione (Gunicorn GeventWebSocketWorker),
 # threading in dev locale se gevent non e' installato.
@@ -343,6 +349,16 @@ def register_device(dev_id, gruppo_url=None, user_agent=None):
 def idle_payload():
     return {"url": "", "url_raw": "", "tipo": "idle", "mode": "iframe",
             "ultimo_aggiornamento": None, "playlist_attiva": False}
+
+
+def connecting_payload():
+    """Stato iniziale di /tv: il gruppo e' risolto dal device_id via WS.
+    Il player mostra 'connessione in corso' finche' il server non invia
+    il contenuto: la schermata pairing appare solo se il server emette
+    esplicitamente un contenuto 'idle' (device nuovo o gruppo vuoto)."""
+    return {"url": "", "url_raw": "", "tipo": "connecting",
+            "mode": "iframe", "ultimo_aggiornamento": None,
+            "playlist_attiva": False}
 
 
 def emit_to_device(dev_id):
@@ -688,7 +704,7 @@ def _player_response(gruppo, content):
 @app.route("/tv")
 def player_device():
     """Player unificato: il gruppo viene risolto dal device_id via WS."""
-    return _player_response(None, idle_payload())
+    return _player_response(None, connecting_payload())
 
 
 @app.route("/tv/<nome_gruppo>")
@@ -723,15 +739,33 @@ SKIP_HEADERS = {"x-frame-options", "content-security-policy",
 PROXY_INTERCEPT = """<script>
 (function () {
   var ORIGIN = %s;
+  // variante http:// dell'origine HTTPS: le pagine remote possono
+  // referenziare asset in http:// (Mixed Content); anche queste
+  // richieste ripassano da /proxy invece di essere bloccate
+  var ORIGIN_HTTP = ORIGIN.indexOf("https://") === 0
+                    ? "http://" + ORIGIN.slice(8) : null;
   // assoluto sull'origine del server signage: con il <base> remoto un
   // path relativo "/proxy?u=" verrebbe risolto verso l'origine target
   var PROX = location.origin + "/proxy?u=";
+  // frame-buster / refresh su window.top (es. view.php): sui browser
+  // moderni la navigazione top e' bloccata dalla sandbox dell'iframe;
+  // su engine vecchi proviamo a deviare top/parent verso window, cosi'
+  // un "top.location = ..." naviga solo l'iframe e non uccide il player
+  try {
+    Object.defineProperty(window, "top",
+      { configurable: true, get: function () { return window; } });
+    Object.defineProperty(window, "parent",
+      { configurable: true, get: function () { return window; } });
+  } catch (e) {}
   function prox(u) {
     if (typeof u !== "string" || !u) return u;
+    if (u.charAt(0) === "#") return u;  // anchor sulla stessa pagina
     var abs;
     try { abs = new URL(u, document.baseURI).href; }
     catch (e) { return u; }
-    return abs.indexOf(ORIGIN) === 0 ? PROX + encodeURIComponent(abs) : u;
+    return (abs.indexOf(ORIGIN) === 0 ||
+            (ORIGIN_HTTP && abs.indexOf(ORIGIN_HTTP) === 0))
+           ? PROX + encodeURIComponent(abs) : u;
   }
   var of = window.fetch;
   window.fetch = function (input, init) {
@@ -749,7 +783,7 @@ PROXY_INTERCEPT = """<script>
   // risorse same-origin iniettate via JS (innerHTML, setAttribute,
   // img.src = ...): il rewrite statico lato server copre solo l'HTML
   // iniziale. Le richieste ripassano da /proxy locale.
-  var ATTRS = ["src", "data-src", "poster"];
+  var ATTRS = ["src", "data-src", "poster", "href"];
   function fixEl(el) {
     if (!el || !el.getAttribute) return;
     for (var i = 0; i < ATTRS.length; i++) {
@@ -766,7 +800,7 @@ PROXY_INTERCEPT = """<script>
     fixEl(root);
     if (root.querySelectorAll) {
       var nodes = root.querySelectorAll(
-        "img, source, video, track, audio");
+        "img, source, video, track, audio, link, a");
       for (var i = 0; i < nodes.length; i++) fixEl(nodes[i]);
     }
   }
@@ -793,6 +827,14 @@ def _same_origin(a, b):
     return pa.scheme == pb.scheme and pa.netloc.lower() == pb.netloc.lower()
 
 
+def _same_host(a, b):
+    """Stesso host a prescindere dallo schema: http://X e' proxy-abile
+    se la whitelist copre https://X. Serve per gli asset http:// che le
+    pagine remote referenziano (Mixed Content) e che PROXY_INTERCEPT
+    instrada comunque su /proxy."""
+    return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+
+
 @app.route("/proxy", methods=["GET", "POST"])
 def proxy_page():
     """Proxy lato server per URL esterni che bloccano gli iframe.
@@ -805,7 +847,8 @@ def proxy_page():
     if not u.lower().startswith(("http://", "https://")):
         abort(400)
     allowed = allowed_proxy_urls()
-    if u not in allowed and not any(_same_origin(u, a) for a in allowed):
+    if u not in allowed and not any(
+            _same_origin(u, a) or _same_host(u, a) for a in allowed):
         abort(403)
     try:
         headers = {"User-Agent": PROXY_UA}
@@ -830,7 +873,15 @@ def proxy_page():
         html = r.text
         r.close()
         p = urlparse(r.url)
-        origin = f"{p.scheme}://{p.netloc}"
+        # <base> http su player HTTPS risolverebbe i path relativi in
+        # http:// -> Mixed Content; promuoviamo a https:// (se l'host
+        # non lo supporta le risorse relative restano comunque
+        # bloccate, nessuna regressione)
+        base_url = ("https" + r.url[4:]
+                    if request.is_secure and p.scheme == "http"
+                    else r.url)
+        bp = urlparse(base_url)
+        origin = f"{bp.scheme}://{bp.netloc}"
         # risorse same-origin (immagini, media, form) via /proxy: l'host
         # remoto puo' rifiutare le richieste dirette del browser (WAF,
         # referer); il fetch server-side usa PROXY_UA e il player riceve
@@ -838,23 +889,65 @@ def proxy_page():
         # remoto risolverebbe un relativo verso l'origine target.
         _self = request.host_url.rstrip("/")
 
+        # Mixed Content: il player gira in HTTPS e blocca i riferimenti
+        # assoluti http:// verso l'host sorgente. Se il target e'
+        # servito in HTTPS li promuoviamo a https://: diventano
+        # same-origin e il rewrite sotto li instrada via /proxy.
+        for _cand in (r.url, u):
+            _pc = urlparse(_cand)
+            if _pc.scheme == "https" and _pc.hostname:
+                _h = _pc.hostname.lower()
+                html = re.sub(r"http://" + re.escape(_h) +
+                              r"(?=[/:?#\s\"'<)]|$)",
+                              "https://" + _h, html, flags=re.I)
+
         def _rw_url(m):
             pre, q, url = m.groups()
-            if _same_origin(url, r.url):
+            if _same_origin(url, r.url) or _same_host(url, r.url):
                 return (f"{pre}{q}{_self}/proxy?u="
                         f"{quote(url, safe='')}{q}")
             return m.group(0)
 
         html = re.sub(
-            r'(\s(?:src|poster|data-src|action)\s*=\s*)(["\'])'
+            r'(\s(?:src|poster|data-src|action|href)\s*=\s*)(["\'])'
             r'(https?://[^"\']+)\2', _rw_url, html, flags=re.I)
+        # <meta http-equiv="refresh" content="N;url=...">: l'auto-refresh
+        # della pagina remota resta dentro /proxy invece di navigare
+        # l'iframe verso l'origine diretta (XFO block / mixed content)
+        def _rw_meta_refresh(m):
+            tag = m.group(0)
+            cm = re.search(r'content\s*=\s*(["\'])(.*?)\1', tag,
+                           re.I | re.S)
+            if not cm:
+                return tag
+            content = cm.group(2)
+            um = re.match(r'(\s*\d+\s*;\s*url\s*=\s*)(.*?)(\s*)$',
+                          content, re.I)
+            if not um:
+                return tag  # refresh senza url: ricarica il doc proxato
+            target = urljoin(r.url, um.group(2).strip().strip('"\''))
+            if not _same_host(target, r.url):
+                return tag
+            prox_url = f"{_self}/proxy?u={quote(target, safe='')}"
+            return (tag[:cm.start(2)] + um.group(1) + prox_url +
+                    tag[cm.end(2):])
+
+        html = re.sub(
+            r'<meta[^>]+http-equiv\s*=\s*["\']?refresh["\']?[^>]*>',
+            _rw_meta_refresh, html, flags=re.I)
         # <base> per risolvere risorse/link relativi verso l'origine
-        inject = (f'<base href="{r.url}">' +
+        inject = (f'<base href="{base_url}">' +
                   PROXY_INTERCEPT % json.dumps(origin))
         m = re.search(r"<head[^>]*>", html, re.I)
         html = (html[:m.end()] + inject + html[m.end():]
                 if m else inject + html)
         resp = Response(html, status=r.status_code, content_type=ctype)
+        if request.is_secure:
+            # upgrade automatico lato browser delle richieste http://
+            # residue (asset caricati via JS/CSS non coperti dal
+            # rewrite statico)
+            resp.headers["Content-Security-Policy"] = \
+                "upgrade-insecure-requests"
     else:
         resp = Response(r.iter_content(64 * 1024), status=r.status_code,
                         content_type=ctype or "application/octet-stream")

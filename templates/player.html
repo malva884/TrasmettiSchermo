@@ -196,6 +196,20 @@
       '</div>';
   }
 
+  // stato iniziale di /tv: il device_id e' gia' nell'handshake WS e il
+  // server risponde subito con il contenuto. La pairing screen deve
+  // apparire SOLO su risposta esplicita 'idle' del server, non come
+  // default nei primi istanti di connessione (flash a ogni reload)
+  function showConnecting() {
+    stage.innerHTML =
+      '<div id="idle">' +
+        '<div class="fb">' +
+          '<div class="t">Connessione in corso&hellip;</div>' +
+          '<div class="s">Regia Centrale TV</div>' +
+        '</div>' +
+      '</div>';
+  }
+
   function render(c) {
     if (!c) return;
     current = c;
@@ -281,6 +295,11 @@
       f.src = src;
       f.setAttribute('frameborder', '0');
       f.setAttribute('scrolling', 'no');
+      // sandbox SENZA allow-top-navigation: la pagina ospitata non puo'
+      // navigare o ricaricare la finestra del player (frame-buster,
+      // top.location/parent.location, refresh su window.top)
+      f.setAttribute('sandbox',
+        'allow-scripts allow-same-origin allow-forms');
       // delega autoplay con audio alle app in iframe: senza l'attributo
       // Chrome blocca l'unmute anche dopo un gesto dell'utente
       f.setAttribute('allow',
@@ -293,6 +312,10 @@
       iframeTimer = setTimeout(function () {
         if (!loaded) showIdle();
       }, 12000);
+    } else if (tipo === 'connecting') {
+      // gruppo in fase di risoluzione via WS: niente pairing screen
+      // (arriva solo se il server invia esplicitamente contenuto 'idle')
+      showConnecting();
     } else {
       showIdle();
     }
