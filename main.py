@@ -780,6 +780,13 @@ PROXY_INTERCEPT = """<script>
     var rest = Array.prototype.slice.call(arguments, 2);
     return oo.apply(this, [method, prox(url)].concat(rest));
   };
+  // window.open(url, "_top"/"_parent") e' un'altra via per navigare il
+  // frame principale: rimappiamo su _self -> resta dentro l'iframe
+  var wo = window.open;
+  window.open = function (url, name) {
+    if (name === "_top" || name === "_parent") name = "_self";
+    return wo.call(window, url, name);
+  };
   // risorse same-origin iniettate via JS (innerHTML, setAttribute,
   // img.src = ...): il rewrite statico lato server copre solo l'HTML
   // iniziale. Le richieste ripassano da /proxy locale.
@@ -935,6 +942,11 @@ def proxy_page():
         html = re.sub(
             r'<meta[^>]+http-equiv\s*=\s*["\']?refresh["\']?[^>]*>',
             _rw_meta_refresh, html, flags=re.I)
+        # target="_top"/"_parent" (link, form, <base target>): altre vie
+        # per navigare la finestra del player -> forzate a _self anche se
+        # la sandbox dell'iframe le bloccherebbe comunque
+        html = re.sub(r'(\starget\s*=\s*)(["\'])_(?:top|parent)\2',
+                      r'\1\2_self\2', html, flags=re.I)
         # <base> per risolvere risorse/link relativi verso l'origine
         inject = (f'<base href="{base_url}">' +
                   PROXY_INTERCEPT % json.dumps(origin))

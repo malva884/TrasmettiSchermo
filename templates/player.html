@@ -299,7 +299,7 @@
       // navigare o ricaricare la finestra del player (frame-buster,
       // top.location/parent.location, refresh su window.top)
       f.setAttribute('sandbox',
-        'allow-scripts allow-same-origin allow-forms');
+        'allow-scripts allow-same-origin allow-forms allow-popups');
       // delega autoplay con audio alle app in iframe: senza l'attributo
       // Chrome blocca l'unmute anche dopo un gesto dell'utente
       f.setAttribute('allow',
